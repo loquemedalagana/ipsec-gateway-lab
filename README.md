@@ -15,10 +15,40 @@
 
 ## 구성
 
-```
-client ──[ net: br0 ]── gw ──(10.0.2.0/24)── app :8080   허용 대상
-10.0.1.2    외부망    10.0.1.1 └─(10.0.3.0/24)── db  :5432   차단 대상
-터널 안 주소 10.9.0.2
+```mermaid
+flowchart LR
+  subgraph C["client (사용자 단말)"]
+    c1["바깥 주소 10.0.1.2<br/>터널 안 주소 10.9.0.2"]
+  end
+  subgraph N["net (외부망)"]
+    br["br0 브리지<br/>캡처 지점 1"]
+  end
+  subgraph G["gw (게이트웨이)"]
+    g1["10.0.1.1<br/>IPsec 종단 + nftables"]
+  end
+  subgraph A["app"]
+    a1["10.0.2.10:8080<br/>허용 대상"]
+  end
+  subgraph D["db"]
+    d1["10.0.3.20:5432<br/>차단 대상"]
+  end
+  c1 == "ESP 터널 (암호문)" ==> br
+  br == "ESP 터널 (암호문)" ==> g1
+  g1 -- "허용 1건, 평문 (캡처 지점 2)" --> a1
+  g1 -. "기본 거부" .-> d1
+  classDef client fill:#1D4ED8,stroke:#1E3A8A,stroke-width:2px,color:#FFFFFF
+  classDef wan fill:#6D28D9,stroke:#4C1D95,stroke-width:2px,color:#FFFFFF
+  classDef gw fill:#D97706,stroke:#92400E,stroke-width:2px,color:#FFFFFF
+  classDef allow fill:#15803D,stroke:#14532D,stroke-width:2px,color:#FFFFFF
+  classDef deny fill:#B91C1C,stroke:#7F1D1D,stroke-width:2px,color:#FFFFFF
+  class c1 client
+  class br wan
+  class g1 gw
+  class a1 allow
+  class d1 deny
+  linkStyle 0,1 stroke:#1D4ED8,stroke-width:4px
+  linkStyle 2 stroke:#15803D,stroke-width:3px
+  linkStyle 3 stroke:#B91C1C,stroke-width:3px
 ```
 
 | 네임스페이스 | 역할 |
@@ -86,12 +116,32 @@ docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update
 
 VPN에서 가장 피해야 할 실패는 "터널이 깨졌는데 요청이 평문으로 그대로 나가는 것"입니다. 보안 정책(SP)은 그대로 두고 SA만 지워서 확인했습니다.
 
+```mermaid
+sequenceDiagram
+  participant C as client
+  participant N as net (br0)
+  participant G as gw
+  participant A as app
+  rect rgba(217, 119, 6, 0.45)
+    Note over C,A: (a) 게이트웨이의 SA만 삭제
+    C->>N: ESP
+    N->>G: ESP
+    Note over G: 풀 SA가 없어 버림 (XfrmInNoStates)
+    Note over A: 도착 0건
+  end
+  rect rgba(185, 28, 28, 0.42)
+    Note over C,A: (b) 클라이언트의 SA도 삭제
+    Note over C: 정책은 있지만 쓸 SA가 없어 내보내지 않음 (XfrmOutNoStates)
+    Note over N: 지나가는 패킷 0개
+  end
+```
+
 | 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 커널 통계 |
 |---|---|---|---|---|---|
 | (a) 게이트웨이의 SA 삭제 | DROP | 2 | 0 | 0 | gw `XfrmInNoStates=2` |
 | (b) 클라이언트의 SA도 삭제 | DROP | 0 | 0 | 0 | client `XfrmOutNoStates=6` |
 
-(로컬 Docker 실행 값. 패킷 수는 재전송 횟수에 따라 달라질 수 있고, 검사는 "요청 실패, 평문 0건, app 도착 0건"만 봅니다.)
+(로컬 Docker와 GitHub Actions에서 같은 값. 패킷 수는 재전송 횟수에 따라 달라질 수 있고, 검사는 "요청 실패, 평문 0건, app 도착 0건"만 봅니다.)
 
 - (a) 클라이언트는 계속 암호화해 보냈지만(ESP 2개) 게이트웨이가 풀 SA가 없어 버렸습니다. 암호문은 내부로 전달되지 않았습니다.
 - (b) 클라이언트는 "이 목적지는 ESP로 보내라"는 정책은 있는데 쓸 SA가 없어서, 패킷을 아예 내보내지 않았습니다. 외부망에는 아무것도 지나가지 않았습니다.
