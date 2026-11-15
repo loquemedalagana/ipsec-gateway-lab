@@ -4,5 +4,5 @@ for ns in client net gw app db; do
   ip netns pids "$ns" 2>/dev/null | xargs -r kill 2>/dev/null
   ip netns del "$ns" 2>/dev/null
 done
-rm -rf /tmp/netns-vpn-lab
+rm -rf /tmp/ipsec-gateway-lab
 exit 0

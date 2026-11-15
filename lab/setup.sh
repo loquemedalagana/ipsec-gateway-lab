@@ -70,8 +70,8 @@ ip -n gw     xfrm policy add src "$INSIDE" dst "$CLIENT_VIP/32" dir out $G2C
 ip netns exec gw nft -f "$(dirname "$0")/policy.nft"
 
 # 내부 서버. db 도 실제로 듣게 해서 "포트가 닫혀서"가 아니라 "정책이 막아서" 실패함을 보인다.
-mkdir -p /tmp/netns-vpn-lab/www && echo "hello from inside" > /tmp/netns-vpn-lab/www/index.html
-ip netns exec app python3 -m http.server 8080 --bind 10.0.2.10 -d /tmp/netns-vpn-lab/www >/dev/null 2>&1 &
-ip netns exec db  python3 -m http.server 5432 --bind 10.0.3.20 -d /tmp/netns-vpn-lab/www >/dev/null 2>&1 &
+mkdir -p /tmp/ipsec-gateway-lab/www && echo "hello from inside" > /tmp/ipsec-gateway-lab/www/index.html
+ip netns exec app python3 -m http.server 8080 --bind 10.0.2.10 -d /tmp/ipsec-gateway-lab/www >/dev/null 2>&1 &
+ip netns exec db  python3 -m http.server 5432 --bind 10.0.3.20 -d /tmp/ipsec-gateway-lab/www >/dev/null 2>&1 &
 sleep 1
 echo "setup done"
