@@ -1,0 +1,22 @@
+# 게이트웨이를 지나가는(forward) 패킷에 대한 접근제어.
+# 기본은 거부(policy drop)이고, 허용은 한 줄씩 명시한다.
+# 차단은 이유별 카운터로 센다 — "막혔다"와 "왜 막혔나"를 같이 남기기 위해서다.
+table inet gw {
+  counter allow_app        { }   # 허용: 터널 사용자 → app:8080
+  counter deny_no_tunnel   { }   # 차단: IPsec 터널을 거치지 않고 들어온 패킷
+  counter deny_not_allowed { }   # 차단: 터널로 들어왔지만 허용 목록에 없는 목적지
+
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+
+    # 이미 허용된 연결의 응답
+    ct state established,related accept
+
+    # 명시 허용 1건: 터널로 들어온(meta ipsec exists) 사용자 주소 → app 의 8080
+    meta ipsec exists ip saddr 10.9.0.2 ip daddr 10.0.2.10 tcp dport 8080 counter name allow_app accept
+
+    # 나머지는 이유를 나눠 세고 버린다
+    meta ipsec missing counter name deny_no_tunnel drop
+    counter name deny_not_allowed drop
+  }
+}

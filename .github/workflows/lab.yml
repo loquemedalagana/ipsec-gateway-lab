@@ -1,0 +1,33 @@
+name: lab
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 도구 설치
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables tcpdump
+
+      - name: 구성 → 패킷 캡처 → 연결 매트릭스 → 검사
+        run: sudo ./run.sh
+
+      - name: 결과를 실행 요약에 붙이기
+        if: always()
+        run: cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 캡처·카운터 원본 보관
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence
+          path: out/
