@@ -91,7 +91,7 @@ F2_ESP=$(n_esp fault_client); F2_LEAK=$(n_leak fault_client); F2_IN=$(n_plain fa
 # ── 요약 (GitHub Actions 요약 화면에 그대로 붙인다) ──
 {
   echo '## 연결 매트릭스'; cat "$OUT/matrix.md"; echo
-  echo 'DROP = 시간 초과(패킷이 버려짐), REFUSED = 연결 거부(포트가 닫힘). 정책이 막으면 DROP 이어야 한다.'; echo
+  echo 'DROP = 시간 초과(패킷이 폐기됨), REFUSED = 연결 거부(포트가 닫힘). 정책이 차단하면 DROP 이어야 한다.'; echo
   echo '## 차단·허용 카운터 (게이트웨이 nftables)'
   echo '| 카운터 | 패킷 수 |'; echo '|---|---|'
   echo "| allow_app | $A |"; echo "| deny_no_tunnel | $N |"; echo "| deny_not_allowed | $D |"; echo
