@@ -29,7 +29,7 @@ check() { # check <설명> <기대값> <파드> <url>
 }
 
 # 노드의 네트워크 네임스페이스에 컨테이너를 붙여 캡처한다: cap_start <파일 이름> <노드> <tcpdump 인자…>
-# -A 로 내용까지 남겨서, 요청 경로에 넣은 표식 문자열이 평문으로 보이는지 센다.
+# -A 로 내용까지 남겨서, 요청 경로에 넣은 마커 문자열이 평문으로 보이는지 센다.
 cap_start() {
   local name=$1 node=$2; shift 2
   docker run -d --name "$CLUSTER-cap-$name" --net "container:$node" --cap-add NET_ADMIN --cap-add NET_RAW \
@@ -45,7 +45,7 @@ cap_stop() { # cap_stop <파일 이름…>
 }
 count()   { grep -c -e "$1" "$OUT/$2.txt" || true; }   # count <패턴> <파일 이름>
 n_esp()   { count 'ESP(spi=' "$1"; }
-# 노드 구간에 평문으로 보인 줄 수: 표식 문자열, app 파드 주소, 포트 8080
+# 노드 간 구간에 평문으로 보인 줄 수: 마커 문자열, app 파드 주소, 포트 8080
 n_leak()  { grep -c -e "$2" -e "${APP_IP//./\\.}\\." -e '\.8080[: ]' "$OUT/$1.txt" || true; }
 
 # ── 0. 암호화 상태: IPsec 이 켜져 있는지 에이전트에게 묻는다 ──
@@ -54,8 +54,8 @@ ENC=$(awk '/^Encryption/ {print $2}' "$OUT/encrypt_status.txt")
 [ "$ENC" = IPsec ] || fail "Cilium 암호화가 IPsec 이 아니다 (현재: ${ENC:-알 수 없음})"
 
 # ── 1. 다른 노드의 파드 사이: client-remote(control-plane) → app(worker) ──
-# 보내는 노드의 eth0 에서 "나가는 방향"만 캡처한다. 받는 쪽에서 캡처하면 복호화된 패킷도 함께 보이기 때문이다.
-# 같은 요청을 받는 노드 안쪽(파드로 가는 구간)에서도 캡처한다.
+# 송신 노드의 eth0 에서 egress(송신) 방향만 캡처한다. 수신 노드에서 캡처하면 복호화된 패킷도 함께 보이기 때문이다.
+# 같은 요청을 수신 노드 내부(파드로 가는 구간)에서도 캡처한다.
 M1="/cross-$RANDOM$RANDOM"
 cap_start cross_wire   "$CP" -i eth0 -Q out "host $WK_IP"
 cap_start cross_inside "$WK" -i any "tcp port 8080"
@@ -63,12 +63,12 @@ sleep 2
 [ "$(outcome client-remote "http://$APP_IP:8080$M1")" = ALLOW ] || fail "다른 노드로 가는 요청 실패"
 cap_stop cross_wire cross_inside
 X_ESP=$(n_esp cross_wire); X_LEAK=$(n_leak cross_wire "$M1"); X_PLAIN=$(count "$M1" cross_inside)
-[ "$X_ESP" -gt 0 ]   || fail "노드 구간에 ESP 패킷이 없다"
-[ "$X_LEAK" -eq 0 ]  || fail "노드 구간에 파드 주소·포트·요청 내용이 평문으로 보인다"
-[ "$X_PLAIN" -gt 0 ] || fail "받는 노드 안쪽에서 복호화된 요청이 보이지 않는다"
+[ "$X_ESP" -gt 0 ]   || fail "노드 간 구간에 ESP 패킷이 없다"
+[ "$X_LEAK" -eq 0 ]  || fail "노드 간 구간에 파드 주소·포트·요청 내용이 평문으로 보인다"
+[ "$X_PLAIN" -gt 0 ] || fail "수신 노드 내부에서 복호화된 요청이 보이지 않는다"
 
 # ── 2. 같은 노드의 파드 사이: client-local(worker) → app(worker) ──
-# 기대: 노드 안쪽에서는 요청이 평문으로 보이고, eth0 에는 이 요청이 아예 나가지 않는다.
+# 기대: 노드 내부에서는 요청이 평문으로 보이고, eth0 에는 이 요청이 아예 나가지 않는다.
 M2="/same-$RANDOM$RANDOM"
 cap_start same_wire   "$WK" -i eth0
 cap_start same_inside "$WK" -i any "tcp port 8080"
@@ -76,7 +76,7 @@ sleep 2
 [ "$(outcome client-local "http://$APP_IP:8080$M2")" = ALLOW ] || fail "같은 노드 안의 요청 실패"
 cap_stop same_wire same_inside
 S_ESP=$(n_esp same_wire); S_LEAK=$(n_leak same_wire "$M2"); S_PLAIN=$(count "$M2" same_inside)
-[ "$S_PLAIN" -gt 0 ] || fail "같은 노드 안쪽에서 평문 요청이 보이지 않는다"
+[ "$S_PLAIN" -gt 0 ] || fail "같은 노드 내부에서 평문 요청이 보이지 않는다"
 [ "$S_LEAK" -eq 0 ]  || fail "같은 노드 요청이 eth0 에 보인다"
 
 # ── 3. 연결 매트릭스: 암호화를 켠 상태에서 허용해야 할 쌍과 막아야 할 쌍을 모두 검사한다 ──
@@ -102,7 +102,7 @@ N_SA=$(grep -c '^src ' "$OUT/xfrm_state.txt" || true)
 if grep -rqE '(0x)?[0-9a-f]{40,}' "$OUT"; then fail "결과 파일에 키처럼 보이는 값이 있다"; fi
 
 # ── 요약 (GitHub Actions 요약 화면에 그대로 붙인다) ──
-# 캡처에서 요청 한 건의 머리줄과 표식이 들어 있는 줄만 뽑는다: req_lines <파일 이름> <표식>
+# 캡처에서 요청 한 건의 머리줄과 마커이 들어 있는 줄만 뽑는다: req_lines <파일 이름> <마커>
 req_lines() { { grep -m1 -E '\.8080: Flags \[P' "$OUT/$1.txt"; grep -m1 -o "GET $2 HTTP/1.1" "$OUT/$1.txt"; } | cut -c1-120 || true; }
 {
   echo "## Cilium IPsec 비교 단계"
@@ -110,7 +110,7 @@ req_lines() { { grep -m1 -E '\.8080: Flags \[P' "$OUT/$1.txt"; grep -m1 -o "GET 
   echo '## 연결 매트릭스'; cat "$OUT/matrix.md"; echo
   echo 'DROP = 시간 초과(패킷이 폐기됨), REFUSED = 연결 거부(포트가 닫힘). 정책이 차단하면 DROP 이어야 한다.'; echo
   echo '## 캡처 요약'
-  echo '| 요청 | 노드 구간(eth0) ESP | 노드 구간 평문 노출 | 노드 안쪽에서 보인 평문 요청 |'
+  echo '| 요청 | 노드 간 구간(eth0) ESP | 노드 간 구간 평문 노출 | 노드 내부에서 보인 평문 요청 |'
   echo '|---|---|---|---|'
   echo "| 다른 노드 (client-remote → app) | $X_ESP | $X_LEAK | $X_PLAIN |"
   echo "| 같은 노드 (client-local → app) | $S_ESP | $S_LEAK | $S_PLAIN |"; echo
@@ -118,11 +118,11 @@ req_lines() { { grep -m1 -E '\.8080: Flags \[P' "$OUT/$1.txt"; grep -m1 -o "GET 
   echo '## 차단 기록 (worker 노드 Cilium 에이전트)'
   echo '| 통계 | 매트릭스 전 | 매트릭스 후 |'; echo '|---|---|---|'
   echo "| cilium_drop_count_total, INGRESS, Policy denied | $D0 | $D1 |"; echo
-  echo "## 다른 노드: 보내는 노드의 eth0, 나가는 방향 — ESP ${X_ESP}개, 평문 노출 ${X_LEAK}개"
+  echo "## 다른 노드: 송신 노드의 eth0, egress 방향 — ESP ${X_ESP}개, 평문 노출 ${X_LEAK}개"
   echo '```'; grep 'ESP(spi=' "$OUT/cross_wire.txt" | head -6 || true; echo '```'
-  echo "## 다른 노드: 받는 노드 안쪽 — 복호화된 요청"
+  echo "## 다른 노드: 수신 노드 내부 — 복호화된 요청"
   echo '```'; req_lines cross_inside "$M1"; echo '```'
-  echo "## 같은 노드: 노드 안쪽 — 평문 요청 (eth0 에는 0개)"
+  echo "## 같은 노드: 노드 내부 — 평문 요청 (eth0 에는 0개)"
   echo '```'; req_lines same_inside "$M2"; echo '```'
   echo "## IPsec SA (worker 노드, ${N_SA}개, 키 생략)"
   echo '```'; grep -E '^src |proto esp|aead ' "$OUT/xfrm_state.txt" || true; echo '```'
