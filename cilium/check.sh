@@ -118,7 +118,7 @@ req_lines() { { grep -m1 -E '\.8080: Flags \[P' "$OUT/$1.txt"; grep -m1 -o "GET 
   echo '## 차단 기록 (worker 노드 Cilium 에이전트)'
   echo '| 통계 | 매트릭스 전 | 매트릭스 후 |'; echo '|---|---|---|'
   echo "| cilium_drop_count_total, INGRESS, Policy denied | $D0 | $D1 |"; echo
-  echo "## 다른 노드: 보내는 노드의 eth0, 나가는 방향 — ESP $X_ESP개, 평문 노출 $X_LEAK개"
+  echo "## 다른 노드: 보내는 노드의 eth0, 나가는 방향 — ESP ${X_ESP}개, 평문 노출 ${X_LEAK}개"
   echo '```'; grep 'ESP(spi=' "$OUT/cross_wire.txt" | head -6 || true; echo '```'
   echo "## 다른 노드: 받는 노드 안쪽 — 복호화된 요청"
   echo '```'; req_lines cross_inside "$M1"; echo '```'
