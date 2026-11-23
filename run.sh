@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 전체 실행: 구성 → 패킷 캡처 → 연결 매트릭스 → 차단 기록 → 장애 실험 → 정리.
+# 전체 실행: 구성 → 패킷 캡처 → 연결 매트릭스 → 차단 기록(카운터·건별 로그) → 장애 실험 → 정리.
 # 검사가 하나라도 어긋나면 0이 아닌 값으로 끝난다(CI 실패).
 # 결과는 out/ 에 남는다. root 권한이 필요하다(sudo ./run.sh).
 set -euo pipefail
@@ -37,6 +37,14 @@ cap_stop() { sleep 1; { ip netns pids net; ip netns pids gw; } | xargs -r kill; 
 n_esp()   { grep -c 'ESP(spi=' "$OUT/$1_wan.txt" || true; }                       # 외부망의 ESP 패킷 수
 n_leak()  { grep -c -e '10\.9\.0\.2' -e '\.8080' "$OUT/$1_wan.txt" || true; }     # 외부망에 평문으로 보인 수
 n_plain() { grep -c '> 10\.0\.2\.10\.8080' "$OUT/$1_inside.txt" || true; }        # app 에 도착한 요청 패킷 수
+# 게이트웨이가 차단한 패킷의 건별 로그: nftables 가 nflog 그룹으로 보낸 것을 이유별 파일로 받는다
+log_start() {
+  ip netns exec gw tcpdump -i nflog:1 -n -l > "$OUT/drop_no_tunnel.txt"   2>/dev/null &
+  ip netns exec gw tcpdump -i nflog:2 -n -l > "$OUT/drop_not_allowed.txt" 2>/dev/null &
+  sleep 1
+}
+log_stop() { sleep 1; ip netns pids gw | xargs -r kill; sleep 0.5; }
+n_log() { grep -c -E "$2" "$OUT/$1.txt" || true; }   # n_log <파일 이름> <정규식>: 맞는 로그 줄 수
 xstat()   { ip netns exec "$1" cat /proc/net/xfrm_stat | awk '$2>0 {printf "%s=%s ", $1, $2} END {print ""}'; }
 
 # ── 1. 패킷 캡처 ──
@@ -49,11 +57,13 @@ ESP=$(n_esp capture); LEAK=$(n_leak capture); PLAIN=$(n_plain capture)
 [ "$PLAIN" -gt 0 ] || fail "안쪽 구간에서 복호화된 요청이 보이지 않는다"
 
 # ── 2. 연결 매트릭스: 허용해야 할 쌍과 막아야 할 쌍을 모두 검사한다 ──
+log_start
 { echo '| 경로 | 기대 | 결과 | 판정 |'; echo '|---|---|---|---|'; } | tee "$OUT/matrix.md"
 check '터널 → app:8080'               ALLOW 10.9.0.2 http://10.0.2.10:8080/
 check '터널 → app:22 (허용 외 포트)'  DROP  10.9.0.2 http://10.0.2.10:22/
 check '터널 → db:5432 (허용 외 서버)' DROP  10.9.0.2 http://10.0.3.20:5432/
 check '터널 없이 → app:8080'          DROP  10.0.1.2 http://10.0.2.10:8080/
+log_stop
 
 # ── 3. 차단 기록: 차단이 이유별 카운터에 남았는지 ──
 ip netns exec gw nft list counters > "$OUT/counters.txt"
@@ -61,6 +71,20 @@ count() { awk -v n="$1" '$1=="counter" && $2==n {f=1} f && $1=="packets" {print 
 A=$(count allow_app); N=$(count deny_no_tunnel); D=$(count deny_not_allowed)
 [ "${A:-0}" -gt 0 ] && [ "${N:-0}" -gt 0 ] && [ "${D:-0}" -gt 0 ] \
   || fail "카운터가 비어 있다 (allow=$A no_tunnel=$N not_allowed=$D)"
+
+# ── 3-1. 건별 로그: 차단된 패킷마다 "누가 어디로"가 남았는지 ──
+# 차단한 것은 이유에 맞는 파일에 있어야 하고, 허용한 것은 어느 파일에도 없어야 한다.
+L_N=$(n_log drop_no_tunnel '^[0-9]'); L_D=$(n_log drop_not_allowed '^[0-9]')
+L_PORT=$(n_log drop_not_allowed '10\.9\.0\.2\.[0-9]+ > 10\.0\.2\.10\.22:')      # 허용 외 포트
+L_DB=$(n_log drop_not_allowed '10\.9\.0\.2\.[0-9]+ > 10\.0\.3\.20\.5432:')     # 허용 외 서버
+L_RAW=$(n_log drop_no_tunnel '10\.0\.1\.2\.[0-9]+ > 10\.0\.2\.10\.8080:')      # IPsec 미적용
+L_ALLOWED=$(cat "$OUT"/drop_*.txt | grep -c -E '10\.9\.0\.2\.[0-9]+ > 10\.0\.2\.10\.8080:' || true)
+[ "$L_PORT" -gt 0 ]    || fail "로그에 '터널 → app:22' 차단이 없다"
+[ "$L_DB" -gt 0 ]      || fail "로그에 '터널 → db:5432' 차단이 없다"
+[ "$L_RAW" -gt 0 ]     || fail "로그에 '터널 없이 → app:8080' 차단이 없다"
+[ "$L_ALLOWED" -eq 0 ] || fail "허용한 요청(터널 → app:8080)이 차단 로그에 있다"
+[ "$L_N" -eq "${N:-0}" ] && [ "$L_D" -eq "${D:-0}" ] \
+  || fail "로그 줄 수가 카운터와 다르다 (no_tunnel 로그=$L_N 카운터=$N, not_allowed 로그=$L_D 카운터=$D)"
 
 # SA 는 키를 지우고 남긴다
 ip -n gw xfrm state | sed -E 's/0x[0-9a-f]{16,}/(key 생략)/' > "$OUT/xfrm_state.txt"
@@ -95,6 +119,11 @@ F2_ESP=$(n_esp fault_client); F2_LEAK=$(n_leak fault_client); F2_IN=$(n_plain fa
   echo '## 차단·허용 카운터 (게이트웨이 nftables)'
   echo '| 카운터 | 패킷 수 |'; echo '|---|---|'
   echo "| allow_app | $A |"; echo "| deny_no_tunnel | $N |"; echo "| deny_not_allowed | $D |"; echo
+  echo "## 차단 로그 (건별): deny_no_tunnel ${L_N}줄, deny_not_allowed ${L_D}줄, 허용한 요청 ${L_ALLOWED}줄"
+  echo 'deny_no_tunnel (IPsec 이 적용되지 않은 패킷)'
+  echo '```'; head -8 "$OUT/drop_no_tunnel.txt"; echo '```'
+  echo 'deny_not_allowed (터널로 들어왔지만 허용 목록에 없는 목적지)'
+  echo '```'; head -8 "$OUT/drop_not_allowed.txt"; echo '```'
   echo "## 패킷 캡처: 외부망 (br0) — ESP ${ESP}개, 평문 노출 ${LEAK}개"
   echo '```'; head -8 "$OUT/capture_wan.txt"; echo '```'
   echo "## 패킷 캡처: 터널 안쪽 (gw-app) — 복호화된 요청 ${PLAIN}개"
