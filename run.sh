@@ -95,9 +95,9 @@ F2_ESP=$(n_esp fault_client); F2_LEAK=$(n_leak fault_client); F2_IN=$(n_plain fa
   echo '## 차단·허용 카운터 (게이트웨이 nftables)'
   echo '| 카운터 | 패킷 수 |'; echo '|---|---|'
   echo "| allow_app | $A |"; echo "| deny_no_tunnel | $N |"; echo "| deny_not_allowed | $D |"; echo
-  echo "## 패킷 캡처: 외부망 (br0) — ESP $ESP개, 평문 노출 $LEAK개"
+  echo "## 패킷 캡처: 외부망 (br0) — ESP ${ESP}개, 평문 노출 ${LEAK}개"
   echo '```'; head -8 "$OUT/capture_wan.txt"; echo '```'
-  echo "## 패킷 캡처: 터널 안쪽 (gw-app) — 복호화된 요청 $PLAIN개"
+  echo "## 패킷 캡처: 터널 안쪽 (gw-app) — 복호화된 요청 ${PLAIN}개"
   echo '```'; head -8 "$OUT/capture_inside.txt"; echo '```'
   echo '## 장애 실험: SA 삭제 (정책은 유지)'
   echo '| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 커널 xfrm 통계 (0 아닌 것) |'
