@@ -1,0 +1,75 @@
+# 파드 4개. nodeName 으로 노드를 고정해서 "다른 노드"와 "같은 노드" 경로를 만든다.
+#
+#   control-plane 노드            worker 노드
+#   client-remote (role=client)   app          (role=app)  :8080 허용 대상, :9090 차단 대상
+#   other         (role=other)    client-local (role=client)
+#
+# app 은 8080 과 9090 을 둘 다 실제로 듣는다.
+# "포트가 닫혀서"가 아니라 "정책이 막아서" 실패함을 보이기 위해서다.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lab
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-conf
+  namespace: lab
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      listen 9090;
+      location / { return 200 "hello from app\n"; }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app
+  namespace: lab
+  labels: { role: app }
+spec:
+  nodeName: ipsec-compare-worker
+  containers:
+    - name: nginx
+      image: nginx:1.27-alpine
+      volumeMounts:
+        - { name: conf, mountPath: /etc/nginx/conf.d }
+  volumes:
+    - name: conf
+      configMap: { name: app-conf }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client-local
+  namespace: lab
+  labels: { role: client }
+spec:
+  nodeName: ipsec-compare-worker
+  containers:
+    - { name: sh, image: "nginx:1.27-alpine", command: ["sleep", "infinity"] }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client-remote
+  namespace: lab
+  labels: { role: client }
+spec:
+  nodeName: ipsec-compare-control-plane
+  containers:
+    - { name: sh, image: "nginx:1.27-alpine", command: ["sleep", "infinity"] }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: other
+  namespace: lab
+  labels: { role: other }
+spec:
+  nodeName: ipsec-compare-control-plane
+  containers:
+    - { name: sh, image: "nginx:1.27-alpine", command: ["sleep", "infinity"] }

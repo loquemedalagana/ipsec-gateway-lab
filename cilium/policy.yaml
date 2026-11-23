@@ -1,0 +1,16 @@
+# 접근제어: app 으로 들어오는 요청은 role=client 파드의 8080 만 허용한다.
+# 정책이 하나라도 붙은 파드는 나머지 ingress 가 기본 거부가 된다.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: app-allow-client-8080
+  namespace: lab
+spec:
+  endpointSelector:
+    matchLabels: { role: app }
+  ingress:
+    - fromEndpoints:
+        - matchLabels: { role: client }
+      toPorts:
+        - ports:
+            - { port: "8080", protocol: TCP }
