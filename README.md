@@ -1,9 +1,13 @@
 # ipsec-gateway-lab
 
+[![lab](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/lab.yml/badge.svg)](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/lab.yml) [![cilium](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/cilium.yml/badge.svg)](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/cilium.yml)
+
 리눅스 네트워크 네임스페이스만으로 만든 작은 VPN 게이트웨이 실습입니다.
 클라이언트와 게이트웨이 사이를 IPsec(ESP 터널 모드)으로 암호화하고, 게이트웨이에서 기본 거부 + 명시 허용으로 접근을 제어한 뒤, 패킷 캡처와 연결 매트릭스로 확인합니다.
 
 제품이 아니라 학습용 실습입니다. 리눅스 커널 기능(`ip netns`, `ip xfrm`, `nftables`)을 셸 스크립트로 조립했습니다.
+
+같은 질문을 쿠버네티스의 노드 간 투명 암호화(Cilium IPsec)에 던진 비교 단계가 따로 있습니다 → [비교: 쿠버네티스 노드 간 투명 암호화](#비교-쿠버네티스-노드-간-투명-암호화-cilium-ipsec)
 
 ## 확인하려는 것
 
@@ -157,6 +161,138 @@ sequenceDiagram
 처음에는 게이트웨이의 외부 쪽 인터페이스(`gw-wan`)에서 캡처했습니다. ESP 패킷 바로 다음 줄에 `10.9.0.2 > 10.0.2.10.8080` 평문 SYN이 기록돼서, "평문 노출 0건" 검사가 실패했습니다.
 
 암호화가 안 된 것이 아니었습니다. 리눅스는 ESP를 복호화한 뒤 안쪽 패킷을 같은 인터페이스로 다시 받은 것처럼 처리하기 때문에, 수신 측에서 캡처하면 암호문과 복호화된 패킷이 둘 다 보입니다. 전송 구간의 패킷을 보려면 양 끝이 아닌 중간 지점에서 캡처해야 합니다. 그래서 둘 사이에 `net` 네임스페이스(브리지)를 넣고 거기서 캡처하도록 바꿨습니다.
+
+## 비교: 쿠버네티스 노드 간 투명 암호화 (Cilium IPsec)
+
+위 실습은 사용자 단말과 게이트웨이 사이에 SA와 키를 직접 넣는 **게이트웨이형**입니다. 같은 커널 기능(xfrm, ESP)을 쿠버네티스에서는 Cilium이 **노드와 노드 사이**에 겁니다. 파드는 암호화를 모르고, 설정은 Secret 하나와 설치 옵션 두 개입니다. 같은 질문을 던졌을 때 무엇이 같고 무엇이 다른지 실측했습니다.
+
+kind로 노드 2개짜리 클러스터를 만들고 Cilium을 IPsec을 켠 채로 설치한 뒤, 파드 4개와 정책 1개를 올립니다 → [cilium/](cilium/), [run-cilium.sh](run-cilium.sh)
+
+```mermaid
+flowchart LR
+  subgraph CPN["control-plane 노드"]
+    cr["client-remote<br/>role=client"]
+    ot["other<br/>role=other"]
+    e1["eth0<br/>캡처 지점 1 (egress 방향)"]
+  end
+  subgraph WKN["worker 노드"]
+    e2["eth0<br/>IPsec 복호화"]
+    cl["client-local<br/>role=client"]
+    ap["app<br/>:8080 허용, :9090 차단<br/>캡처 지점 2 (노드 내부)"]
+  end
+  cr -- "평문" --> e1
+  e1 == "ESP (암호문)" ==> e2
+  e2 -- "평문" --> ap
+  cl -- "평문, eth0을 지나지 않음" --> ap
+  ot -. "정책 차단 (worker에서 폐기)" .-> ap
+  classDef client fill:#1D4ED8,stroke:#1E3A8A,stroke-width:2px,color:#FFFFFF
+  classDef wan fill:#6D28D9,stroke:#4C1D95,stroke-width:2px,color:#FFFFFF
+  classDef allow fill:#15803D,stroke:#14532D,stroke-width:2px,color:#FFFFFF
+  classDef deny fill:#B91C1C,stroke:#7F1D1D,stroke-width:2px,color:#FFFFFF
+  class cr,cl client
+  class e1,e2 wan
+  class ap allow
+  class ot deny
+  linkStyle 1 stroke:#1D4ED8,stroke-width:4px
+  linkStyle 2,3 stroke:#15803D,stroke-width:3px
+  linkStyle 4 stroke:#B91C1C,stroke-width:3px
+```
+
+### 검사 항목
+
+[cilium/check.sh](cilium/check.sh)는 아래가 하나라도 어긋나면 실패로 끝납니다. 출력 형식과 `ALLOW`/`DROP`/`REFUSED`의 뜻은 `run.sh`와 같습니다.
+
+| 검사 | 기대 |
+|---|---|
+| 암호화 상태 | Cilium 에이전트가 `Encryption: IPsec`이라고 답함 |
+| 다른 노드의 파드 사이 (client-remote → app) | 송신 노드의 `eth0`에 ESP가 있고, 파드 주소·포트 `8080`·요청 경로의 마커 문자열은 0건. 수신 노드 내부에서는 마커 문자열이 보임 |
+| 같은 노드의 파드 사이 (client-local → app) | 노드 내부에서 마커 문자열이 평문으로 보이고, `eth0`에는 이 요청이 0건 |
+| client(다른 노드) → app:8080 | ALLOW |
+| client(같은 노드) → app:8080 | ALLOW |
+| client → app:9090 | DROP (허용 외 포트, 포트는 열려 있음) |
+| other → app:8080 | DROP (허용 외 파드) |
+| 차단 기록 | worker 노드의 `Policy denied` 폐기 수가 매트릭스 전보다 늘어남 |
+| 결과 파일 | 키처럼 보이는 긴 16진수가 없음 |
+
+노드 사이에는 이 요청과 무관한 통신도 ESP로 오갑니다. ESP 개수만으로는 "내 요청이 암호화됐다"고 말할 수 없어서, 요청 경로에 실행할 때마다 다른 문자열(`/cross-…`, `/same-…`)을 넣고 그 문자열이 어디에서 평문으로 보이는지를 기준으로 삼았습니다.
+
+### 결과
+
+로컬(macOS, Docker Desktop, kind v0.33.0, Cilium 1.20.1)에서 클러스터를 지우고 처음부터 실행한 값입니다.
+
+| 요청 | 노드 간 구간(`eth0`) ESP | 노드 간 구간 평문 노출 | 노드 내부에서 보인 평문 요청 |
+|---|---|---|---|
+| 다른 노드 (client-remote → app) | 6 | 0 | 4 |
+| 같은 노드 (client-local → app) | 0 | 0 | 4 |
+
+| 경로 | 기대 | 결과 |
+|---|---|---|
+| client(다른 노드) → app:8080 | ALLOW | ALLOW |
+| client(같은 노드) → app:8080 | ALLOW | ALLOW |
+| client → app:9090 (허용 외 포트) | DROP | DROP |
+| other → app:8080 (허용 외 파드) | DROP | DROP |
+
+- 다른 노드로 간 요청은 노드 간 구간에서 `172.18.0.2 > 172.18.0.3: ESP(spi=0x00000003,…)`으로만 보였습니다. 바깥 주소는 노드 주소이고 파드 주소는 보이지 않습니다. 같은 요청이 수신 노드 내부에서는 `10.244.0.123 > 10.244.1.94.8080`, `GET /cross-… HTTP/1.1`로 보였습니다.
+- 같은 노드 안의 요청은 파드의 veth(`lxc…`)에서 `GET /same-… HTTP/1.1`이 평문으로 보였고, `eth0`에는 나가지 않았습니다. **암호화는 노드를 벗어나는 구간에만 적용됩니다.**
+- 정책에 없는 요청 2건은 모두 `DROP`이었고, worker 노드의 `cilium_drop_count_total{direction=INGRESS, reason=Policy denied}`가 0에서 4로 늘었습니다.
+- worker 노드의 SA는 4개였고 모두 `proto esp spi 0x00000003 mode tunnel`, `aead rfc4106(gcm(aes))`입니다. SA의 주소 쌍은 노드 IP 쌍과 파드 대역(`10.244.x.x`) 안의 주소 쌍 두 종류였고, 실습 파드의 주소를 가진 SA는 없었습니다. 파드마다 SA가 생기지는 않습니다.
+
+(패킷 수와 주소는 실행마다 달라질 수 있고, 검사는 위 「검사 항목」의 조건만 봅니다.)
+
+### 네거티브 테스트: 의도적으로 잘못 구성했을 때
+
+검사가 "항상 통과하는 검사"가 아닌지 확인하려고 두 가지 방식으로 의도적으로 잘못 구성해 봤습니다. 둘 다 `RESULT: FAIL`, 종료 코드 1로 끝났습니다.
+
+| 바꾼 것 | 암호화 검사 | 연결 매트릭스 | 차단 기록 |
+|---|---|---|---|
+| IPsec을 끄고 설치 (`ENCRYPT=0 ./run-cilium.sh`) | 실패: 상태 `Disabled`, 노드 간 구간 ESP 0개, 평문 노출 7건 | 4건 모두 기대와 일치 | 0 → 4 |
+| 정책 삭제 (`kubectl delete -f cilium/policy.yaml` 뒤 `cilium/check.sh`) | 통과 | 실패: `app:9090`, `other → app:8080`이 `ALLOW` | 실패: 8 → 8 (늘지 않음) |
+
+암호화를 꺼도 정책은 그대로 차단했고, 정책을 지워도 암호화는 그대로였습니다. 게이트웨이형에서 확인한 "암호화와 접근제어는 별개"가 여기서도 같습니다.
+
+### 게이트웨이형과 나란히
+
+| | 게이트웨이형 (`run.sh`) | 노드 간 투명 암호화 (`run-cilium.sh`) |
+|---|---|---|
+| 암호화 구간 | 사용자 단말 ↔ 게이트웨이 | 노드 ↔ 노드 |
+| 누가 암호화를 아는가 | 단말에 SA·정책·터널 안 주소가 있어야 함 | 파드는 모름. 노드의 커널이 처리 |
+| SA의 주소 | 단말과 게이트웨이의 바깥 주소 | 노드마다 정해진 주소 쌍. 파드별 SA 없음 |
+| SA·키를 넣는 주체 | 스크립트가 `ip xfrm`으로 직접. 방향별 키 2개 | Secret 하나를 주면 Cilium 에이전트가 각 노드에 SA를 설치 |
+| SPI | 방향마다 다름 (`0x1001`, `0x1002`) | 양방향 모두 `0x00000003` (Secret의 키 번호) |
+| 암호화 대상을 정하는 것 | 보안 정책(SP): `10.9.0.2 ↔ 10.0.2.0/23` | 목적지 파드가 다른 노드에 있는지 |
+| 바깥 구간 캡처 | ESP만, 터널 안 주소·포트 0건 | ESP만, 파드 주소·포트·요청 내용 0건 |
+| 암호화되지 않는 경로 | IPsec이 적용되지 않은 요청은 게이트웨이가 차단 (`DROP`) | 같은 노드의 파드 사이는 평문으로 전달 (`ALLOW`) |
+| 접근제어를 하는 곳 | 게이트웨이 한 곳 (nftables forward 체인) | 받는 파드가 있는 노드 (Cilium 정책) |
+| 요청자를 구분하는 기준 | 터널 안 주소 `10.9.0.2` | 파드 라벨 `role=client` |
+| 차단 기록 | nftables 카운터 (`deny_no_tunnel`, `deny_not_allowed`) | Cilium 통계 (`Policy denied`) |
+| SA가 없어졌을 때 | 실험함: 실패 시 차단 | 실험하지 않음 |
+| 실행 | 리눅스 네임스페이스, root | kind 클러스터, Docker |
+
+가장 큰 차이는 "암호화되지 않는 경로"입니다. 게이트웨이형은 터널을 거치지 않으면 내부로 들어올 수 없게 만드는 것이 목적이라, IPsec이 적용되지 않은 요청을 차단합니다. 노드 간 투명 암호화는 노드 밖 구간의 도청을 막는 것이 목적이라, 같은 노드 안의 요청은 평문인 채로 허용합니다. 누가 무엇에 접근할 수 있는지는 두 경우 모두 암호화가 아니라 별도의 정책이 정합니다.
+
+### 실행
+
+`docker`, `kind`, `kubectl`, `cilium`(cilium-cli)이 필요합니다. root 권한은 필요 없습니다.
+
+```bash
+./run-cilium.sh
+```
+
+- 올리기 전에 Docker에 남은 메모리를 확인하고, 3000MiB보다 적으면 클러스터를 만들지 않고 끝냅니다(`NEED_MB`로 조정).
+- 전용 kubeconfig 파일을 쓰므로 `~/.kube/config`와 현재 컨텍스트는 바뀌지 않습니다. 끝나면 클러스터 `ipsec-compare`를 지웁니다.
+- `KEEP=1 ./run-cilium.sh`는 클러스터를 남깁니다. `cilium/check.sh`만 다시 돌릴 수 있고, 정리는 `cilium/down.sh`입니다.
+- IPsec 키는 실행할 때마다 새로 만들어 표준 입력으로 Secret에 넣습니다. 화면과 파일에 출력하지 않습니다 → [cilium/up.sh](cilium/up.sh)
+- 결과는 `out-cilium/`에 남습니다.
+
+### 이 비교의 한계
+
+- 캡처 지점이 경로 중간(제3자 관점)이 아닙니다. 게이트웨이형에서는 양 끝 사이의 브리지에서 캡처했지만, 여기서는 송신 노드의 `eth0`에서 egress(송신) 방향만 캡처했습니다. 노드 사이의 Docker 브리지에서는 캡처하지 않았습니다.
+- "같은 노드의 요청은 암호화되지 않는다"는 노드 내부에서 평문이 보이고 `eth0`에 나가지 않았다는 것으로 확인했습니다. 노드 안에서 패킷이 지나는 모든 지점을 본 것은 아닙니다.
+- SA를 지웠을 때 평문으로 유출되는지(게이트웨이형의 장애 실험)는 Cilium 쪽에서 실험하지 않았습니다.
+- 키 교체는 실험하지 않았습니다. 키는 설치할 때 한 번 넣습니다.
+- 노드 2개, 파드 4개, 정책 1개입니다. 서비스(ClusterIP)를 거치는 요청, 클러스터 밖으로 나가는 요청, 호스트 네트워크 파드는 다루지 않았습니다.
+- 지연과 처리량은 측정하지 않았습니다.
+- 이 단계는 [별도 워크플로](.github/workflows/cilium.yml)로 두었고, GitHub Actions(ubuntu-24.04)에서도 같은 검사가 통과했습니다. 위 수치는 로컬 실행 결과입니다.
 
 ## 한계
 

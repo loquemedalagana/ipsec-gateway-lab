@@ -1,0 +1,10 @@
+# 노드 2개. "다른 노드로 가는 요청"과 "같은 노드 안의 요청"을 나눠 보려면 노드가 둘 이상이어야 한다.
+# CNI 와 kube-proxy 는 넣지 않고 Cilium 이 대신한다.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  kubeProxyMode: none
+nodes:
+  - role: control-plane
+  - role: worker

@@ -1,0 +1,56 @@
+name: cilium
+
+# 비교 단계(kind 2노드 + Cilium IPsec). 게이트웨이형 실습(lab.yml)과 따로 돈다.
+# 이미지를 받는 시간이 길어서, 이 단계와 관련된 파일이 바뀌었을 때와 수동 실행 때만 돈다.
+on:
+  push:
+    paths:
+      - 'cilium/**'
+      - 'run-cilium.sh'
+      - '.github/workflows/cilium.yml'
+  pull_request:
+    paths:
+      - 'cilium/**'
+      - 'run-cilium.sh'
+      - '.github/workflows/cilium.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CILIUM_CLI_VERSION: v0.20.1
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 도구 확인 (docker, kind, kubectl 은 러너에 들어 있다)
+        run: docker version --format '{{.Server.Version}}' && kind version && kubectl version --client
+
+      - name: cilium-cli 설치 (체크섬 확인)
+        run: |
+          cd "$RUNNER_TEMP"
+          base=https://github.com/cilium/cilium-cli/releases/download/$CILIUM_CLI_VERSION
+          curl -fsSL --remote-name-all "$base/cilium-linux-amd64.tar.gz" "$base/cilium-linux-amd64.tar.gz.sha256sum"
+          sha256sum --check cilium-linux-amd64.tar.gz.sha256sum
+          sudo tar xzf cilium-linux-amd64.tar.gz -C /usr/local/bin cilium
+          cilium version --client
+
+      - name: 구성 → 캡처 → 연결 매트릭스 → 검사 → 정리
+        run: ./run-cilium.sh
+
+      - name: 결과를 실행 요약에 붙이기
+        if: always()
+        run: test -f out-cilium/summary.md && cat out-cilium/summary.md >> "$GITHUB_STEP_SUMMARY" || echo '요약 파일이 없다 (구성 단계에서 실패)' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 캡처 원본 보관
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-cilium
+          path: out-cilium/
+          if-no-files-found: ignore
