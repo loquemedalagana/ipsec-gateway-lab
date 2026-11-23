@@ -1,5 +1,7 @@
 # ipsec-gateway-lab
 
+[![lab](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/lab.yml/badge.svg)](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/lab.yml) [![cilium](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/cilium.yml/badge.svg)](https://github.com/loquemedalagana/ipsec-gateway-lab/actions/workflows/cilium.yml)
+
 리눅스 네트워크 네임스페이스만으로 만든 작은 VPN 게이트웨이 실습입니다.
 클라이언트와 게이트웨이 사이를 IPsec(ESP 터널 모드)으로 암호화하고, 게이트웨이에서 기본 거부 + 명시 허용으로 접근을 제어한 뒤, 패킷 캡처와 연결 매트릭스로 확인합니다.
 
@@ -290,7 +292,7 @@ flowchart LR
 - 키 교체는 실험하지 않았습니다. 키는 설치할 때 한 번 넣습니다.
 - 노드 2개, 파드 4개, 정책 1개입니다. 서비스(ClusterIP)를 거치는 요청, 클러스터 밖으로 나가는 요청, 호스트 네트워크 파드는 다루지 않았습니다.
 - 지연과 처리량은 측정하지 않았습니다.
-- 이 단계는 [별도 워크플로](.github/workflows/cilium.yml)로 두었습니다. 위 수치는 로컬 실행 결과입니다.
+- 이 단계는 [별도 워크플로](.github/workflows/cilium.yml)로 두었고, GitHub Actions(ubuntu-24.04)에서도 같은 검사가 통과했습니다. 위 수치는 로컬 실행 결과입니다.
 
 ## 한계
 
