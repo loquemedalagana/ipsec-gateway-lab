@@ -5,7 +5,7 @@
 리눅스 네트워크 네임스페이스만으로 만든 작은 VPN 게이트웨이 실습입니다.
 클라이언트와 게이트웨이 사이를 IPsec(ESP 터널 모드)으로 암호화하고, 게이트웨이에서 기본 거부 + 명시 허용으로 접근을 제어한 뒤, 패킷 캡처와 연결 매트릭스로 확인합니다.
 
-별도 VPN 소프트웨어 없이 리눅스 커널 기능(`ip netns`, `ip xfrm`, `nftables`)만으로 구성했고, 셸 스크립트로 조립했습니다.
+암호화와 접근제어는 리눅스 커널 기능(`ip netns`, xfrm, `nftables`)이 하고, 키 교환(IKE)만 strongSwan에 맡겼습니다. 전체를 셸 스크립트로 조립했습니다.
 
 같은 질문을 쿠버네티스의 노드 간 투명 암호화(Cilium IPsec)에 던진 비교 단계가 따로 있습니다 → [비교: 쿠버네티스 노드 간 투명 암호화](#비교-쿠버네티스-노드-간-투명-암호화-cilium-ipsec)
 
@@ -16,6 +16,7 @@
 3. IPsec이 적용되지 않은 요청은 차단되는가
 4. 차단은 이유와 함께, 무엇이 차단됐는지까지 기록되는가
 5. SA가 없어졌을 때 요청이 평문으로 유출되지 않는가
+6. 키를 사람이 넣지 않고 IKE로 협상해도 위 결과가 그대로인가 — 키를 바꿔도 통신이 이어지고, 인증에 실패하면 요청이 평문으로 나가지 않는가
 
 ## 구성
 
@@ -57,12 +58,13 @@ flowchart LR
 
 | 네임스페이스 | 역할 |
 |---|---|
-| `client` | 사용자 단말. 터널 안 주소 `10.9.0.2`로 내부망에 접근 |
+| `client` | 사용자 단말. 터널 안 주소 `10.9.0.2`로 내부망에 접근. IKE 데몬 1개 |
 | `net` | 클라이언트와 게이트웨이 사이의 외부망(브리지). 제3자가 보는 패킷을 여기서 캡처 |
-| `gw` | 게이트웨이. IPsec 종단 + nftables 접근제어 |
+| `gw` | 게이트웨이. IPsec 종단 + nftables 접근제어. IKE 데몬 1개 |
 | `app`, `db` | 내부 서버. 둘 다 실제로 포트를 열고 있음 |
 
-- IPsec: ESP 터널 모드, AES-GCM, 방향별 SA 2개. 키는 실행할 때마다 새로 만들고 출력하지 않습니다 → [lab/setup.sh](lab/setup.sh)
+- IPsec: ESP 터널 모드, AES-GCM, 방향별 SA 2개 → [lab/setup.sh](lab/setup.sh)
+- 키 관리: SA와 키는 양쪽의 IKE 데몬(strongSwan, IKEv2)이 사전공유키(PSK)로 서로 인증한 뒤 협상해서 커널에 넣습니다. 사전공유키는 실행할 때마다 새로 만들고 출력하지 않습니다 → [lab/swanctl/](lab/swanctl/), [키 관리: 수동 키에서 IKE로](#키-관리-수동-키에서-ike로)
 - 접근제어: forward 체인 기본 거부, 허용 1건(`터널 사용자 → app:8080`), 차단은 이유별 카운터 + 패킷별 로그 → [lab/policy.nft](lab/policy.nft)
 
 ## 이론과 명령의 대응
@@ -73,18 +75,19 @@ flowchart LR
 |---|---|---|
 | ESP: 기밀성과 무결성을 제공하는 IPsec 프로토콜 | `proto esp` | 외부망 캡처의 `ESP(spi=…)` |
 | 터널 모드: 원래 IP 패킷 전체를 암호화하고 새 IP 헤더를 붙임 | `mode tunnel` | 외부망에는 바깥 주소 `10.0.1.2 > 10.0.1.1`만, 안쪽 주소 `10.9.0.2`는 안 보임 |
-| SA(보안 연관): 단방향이고 SPI로 식별 | `ip xfrm state` 2개 (`spi 0x1001`, `0x1002`) | 방향마다 다른 SPI가 캡처에 기록됨 |
+| SA(보안 연관): 단방향이고 SPI로 식별 | `ip xfrm state` 2개 (SPI는 IKE가 정하므로 실행마다 다름) | 방향마다 다른 SPI가 캡처에 기록됨 |
 | 보안 정책(SPD): 어떤 트래픽에 IPsec을 적용할지 | `ip xfrm policy` | 터널 안 주소로 보낸 요청만 ESP로 나감 |
 | 재전송 방지: 순서 번호와 윈도우 | `replay-window 32` | 캡처의 `seq=0x1, 0x2, …` |
 | 인증 암호화(AEAD) | `aead rfc4106(gcm(aes))` | SA 출력 |
 | ARP: IP 주소로 MAC 주소를 알아냄 | 설정 없음 (커널이 첫 패킷 전에 자동 수행) | 두 캡처 맨 앞의 `ARP, Request who-has …`. IPsec은 IP 계층부터 보호하므로 ARP는 터널 밖에서 평문으로 보임 |
-| 키 교환(IKE) | 없음 — 키를 스크립트가 직접 넣음 | 「한계」 참조 |
+| 키 교환(IKE): 서로 인증한 뒤 키와 SA를 협상 | strongSwan `swanctl.conf` (IKEv2, `auth = psk`, X25519) | `out/ike_sas.txt`의 `ESTABLISHED`, 외부망 캡처의 `isakmp`(UDP 500) |
+| 키 교체(rekey)와 PFS: 키를 바꿀 때 키 교환을 새로 함 | `swanctl --rekey`, `esp_proposals = aes128gcm16-x25519` | 교체 전후의 SPI가 다르고 요청은 계속 됨 |
 | 기본 거부 + 명시 허용 | nftables `policy drop` + 허용 1줄 | 연결 매트릭스, 카운터 |
 | 책임추적성: 무엇이 차단됐는지 기록 | nftables `log … group N` (nflog) | `out/drop_*.txt`의 출발지·목적지·포트 |
 
 ## 실행
 
-GitHub Actions가 푸시마다 전체를 실행합니다. 실행 화면의 **Summary**에 연결 매트릭스, 카운터, 차단 로그, 패킷 캡처가 표시되고, 원본은 `evidence` 아티팩트로 남습니다.
+GitHub Actions가 푸시마다 전체를 실행합니다. 실행 화면의 **Summary**에 IKE 협상 결과, 연결 매트릭스, 카운터, 차단 로그, 패킷 캡처, 키 교체, 장애 실험이 표시되고, 원본은 `evidence` 아티팩트로 남습니다.
 
 로컬(리눅스, root):
 
@@ -92,10 +95,12 @@ GitHub Actions가 푸시마다 전체를 실행합니다. 실행 화면의 **Sum
 sudo ./run.sh
 ```
 
+`iproute2`, `nftables`, `tcpdump`, `curl`, `python3`, `strongswan-charon`, `strongswan-swanctl`이 필요합니다. 실행하는 동안 `/etc/netns/client`, `/etc/netns/gw`, `/tmp/ipsec-gateway-lab`을 만들고, 끝나면 지웁니다.
+
 macOS에서는 Docker로 실행합니다.
 
 ```bash
-docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update -qq && apt-get install -y -qq iproute2 nftables tcpdump curl python3 && /lab/run.sh'
+docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update -qq && apt-get install -y -qq iproute2 nftables tcpdump curl python3 strongswan-charon strongswan-swanctl && /lab/run.sh'
 ```
 
 ## 검사 항목
@@ -104,6 +109,7 @@ docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update
 
 | 검사 | 기대 |
 |---|---|
+| IKE 협상 | 양쪽 데몬이 모두 `ESTABLISHED`, 커널의 SA는 방향별 1개씩이고 양쪽의 SPI가 같음 |
 | 외부망 캡처 | ESP 패킷이 있고, 터널 안 주소(`10.9.0.2`)와 포트(`8080`)는 0건 |
 | 터널 안쪽 캡처 | 복호화된 HTTP 요청이 보임 |
 | 터널 → app:8080 | ALLOW |
@@ -112,7 +118,10 @@ docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update
 | 터널 없이 → app:8080 | DROP |
 | 카운터 | `allow_app`, `deny_no_tunnel`, `deny_not_allowed` 모두 0보다 큼 |
 | 차단 로그 | 차단한 3건이 이유에 맞는 파일에 있고, 허용한 요청은 0줄, 줄 수는 카운터와 같음 |
-| 장애 실험 (a)(b) | 요청 실패, 외부망 평문 0건, app 도착 0건 |
+| 키 교체 | 교체 뒤 요청 ALLOW, 새 SPI가 방향별 1개씩 생김, 외부망에 IKE 메시지가 있고 평문 0건 |
+| 장애 실험 (a)(b): 커널의 SA 삭제 | 요청 실패, 외부망 평문 0건, app 도착 0건 |
+| 장애 실험 (c): 다시 협상 | 요청 ALLOW, 외부망에 IKE 메시지가 있고 평문 0건 |
+| 장애 실험 (d): 사전공유키 불일치 | 요청 실패, 인증 실패 기록이 있고 IKE SA 0개, 외부망 ESP·평문 0건, app 도착 0건 |
 
 결과는 세 가지로 나눕니다. `ALLOW`는 응답을 받은 것, `DROP`은 시간 초과(패킷이 응답 없이 폐기됨), `REFUSED`는 연결 거부(서버까지 갔는데 포트가 닫혀 있음)입니다. 정책이 차단했다면 `DROP`이어야 하고, `REFUSED`가 나오면 정책이 아니라 닫힌 포트 때문에 실패한 것이므로 검사가 실패합니다.
 
@@ -144,9 +153,129 @@ docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update
 - 검사는 양쪽을 다 봅니다. 차단한 3건이 이유에 맞는 파일에 있어야 하고, 허용한 요청은 어느 파일에도 없어야 합니다. 로그 줄 수가 카운터와 같은지도 확인합니다.
 - 차단 규칙 하나에서 `log`를 빼고 실행하면 `RESULT: FAIL`로 끝납니다(해당 차단이 로그에 없음, 줄 수가 카운터와 다름).
 
+## 키 관리: 수동 키에서 IKE로
+
+### 이전 방식: SA를 직접 만든다
+
+`v1.2`까지는 스크립트가 키와 SPI를 정해서 SA를 직접 만들었습니다 → [v1.2의 lab/setup.sh](https://github.com/loquemedalagana/ipsec-gateway-lab/blob/v1.2/lab/setup.sh)
+
+```bash
+ip -n "$ns" xfrm state add src "$CLIENT_WAN" dst "$GW_WAN" proto esp spi 0x1001 reqid 1 replay-window 32 \
+  mode tunnel aead 'rfc4106(gcm(aes))' "$K_C2G" 128
+```
+
+같은 명령을 방향마다 한 번씩, `client`와 `gw` 양쪽에 넣어 모두 4번 실행했습니다. ESP가 어떻게 동작하는지 보기에는 충분했지만 한계가 있었습니다.
+
+- 키와 SPI가 처음 넣은 값 그대로입니다. 실행하는 동안 바뀌지 않습니다.
+- 상대가 누구인지 확인하는 절차가 없습니다. 같은 키를 가진 쪽이면 통합니다.
+- SA가 지워지면 다시 만들어 줄 주체가 없습니다.
+
+### 바꾼 방식: 조건만 적고, SA는 IKE가 만든다
+
+`client`와 `gw`에 IKE 데몬(strongSwan `charon`)을 하나씩 띄웠습니다. 설정에는 키도 SPI도 없고, 누구와 어떻게 인증하고 어떤 트래픽을 보호할지만 적습니다 → [lab/swanctl/client.conf](lab/swanctl/client.conf), [lab/swanctl/gw.conf](lab/swanctl/gw.conf)
+
+```
+connections {
+  gw {
+    version = 2                                   # IKEv2
+    local_addrs  = 10.0.1.2
+    remote_addrs = 10.0.1.1
+    local {                                       # 사전공유키(PSK)로 서로 인증
+      auth = psk
+      id = client
+    }
+    children {
+      inside {
+        mode = tunnel
+        local_ts  = 10.9.0.2/32                   # 터널 안 주소
+        remote_ts = 10.0.2.0/23                   # 보호 대역
+        esp_proposals = aes128gcm16-x25519
+        start_action = trap                       # 정책을 먼저 걸어 둔다
+      }
+    }
+  }
+}
+```
+
+(`client.conf`에서 일부만 옮긴 것입니다.)
+
+```mermaid
+sequenceDiagram
+  participant S as 스크립트
+  participant C as client
+  participant G as gw
+  rect rgba(109, 40, 217, 0.30)
+    Note over S,G: 이전: 수동 키
+    S->>C: ip xfrm state add (SPI, 키)
+    S->>G: ip xfrm state add (같은 SPI, 같은 키)
+  end
+  rect rgba(29, 78, 216, 0.30)
+    Note over S,G: 지금: IKEv2 (UDP 500)
+    S->>C: 설정 + 사전공유키
+    S->>G: 설정 + 사전공유키
+    C->>G: IKE_SA_INIT (키 교환: X25519)
+    G->>C: IKE_SA_INIT
+    C->>G: IKE_AUTH (PSK 인증, 보호할 대역 제안) — 여기부터 암호화
+    G->>C: IKE_AUTH
+    Note over C: 데몬이 커널에 SA·정책 설치
+    Note over G: 데몬이 커널에 SA·정책 설치
+  end
+  rect rgba(21, 128, 61, 0.30)
+    Note over S,G: 그 뒤는 같다
+    C->>G: ESP
+    G->>C: ESP
+  end
+```
+
+| | 수동 키 (`v1.2`까지) | IKE (지금) |
+|---|---|---|
+| SA를 넣는 주체 | 스크립트가 `ip xfrm state add` 4번 | 양쪽 데몬이 협상한 뒤 각자 설치 |
+| 키 | 스크립트가 만든 임의 값을 양쪽에 그대로 복사 | 키 교환(X25519)으로 양쪽이 각자 계산. 키 자체는 전송되지 않음 |
+| SPI | 고정 (`0x1001`, `0x1002`) | 협상할 때마다 다름 |
+| 상대 인증 | 없음 | 사전공유키(PSK) |
+| 키 교체 | 없음 | 있음. 교체해도 통신이 이어짐 |
+| 보안 정책(SP) | 스크립트가 `ip xfrm policy add` 4번 | 데몬이 설정의 `local_ts`, `remote_ts`로 설치 |
+| 커널의 SA만 지워졌을 때 | 계속 차단 | 계속 차단 (데몬은 지워진 것을 모름) |
+| 인증에 실패했을 때 | 해당 없음 | SA가 생기지 않고 요청은 폐기됨 |
+
+달라지지 않은 것도 있습니다. 패킷을 암호화하는 것은 여전히 커널(xfrm, ESP)이고, IKE는 커널에 SA를 넣는 방법만 바꿉니다. 그래서 커널에 들어간 SA는 `ip xfrm state`로 전과 같은 모양으로 보이고, 연결 매트릭스·카운터·차단 로그 검사는 고치지 않고 그대로 통과했습니다. 게이트웨이의 nftables 접근제어도 그대로입니다.
+
+### 결과: 협상, 키 교체
+
+| | 값 |
+|---|---|
+| IKE SA | `client`, `gw` 모두 `ESTABLISHED` (`AES_GCM_16-256/PRF_HMAC_SHA2_256/CURVE_25519`) |
+| 협상된 SPI (양쪽 커널에서 동일) | `0xc2cbe4f8`, `0xc5236144` |
+| 키 교체 뒤 새로 생긴 SPI | `0xc9300359`, `0xc99f880f` |
+| 키 교체 뒤 요청 | ALLOW |
+| 키 교체 중 외부망 | IKE 메시지 4개, 평문 0건 |
+
+(로컬 Docker 실행 값. SPI는 실행마다 다릅니다.)
+
+키 교체는 외부망에서 이렇게 보였습니다. IKE 메시지의 종류만 보이고 내용은 암호화되어 있습니다.
+
+```
+IP 10.0.1.2.500 > 10.0.1.1.500: isakmp: child_sa  child_sa[I]
+IP 10.0.1.1.500 > 10.0.1.2.500: isakmp: child_sa  child_sa[R]
+IP 10.0.1.2.500 > 10.0.1.1.500: isakmp: child_sa  inf2[I]
+IP 10.0.1.1.500 > 10.0.1.2.500: isakmp: child_sa  inf2[R]
+```
+
+앞의 두 줄이 새 SA를 협상하는 교환이고, 뒤의 두 줄이 이전 SA를 지우는 교환입니다.
+
+### 정책을 먼저 걸어 두는 이유
+
+`start_action = trap`은 SA가 아직 없어도 보안 정책(SP)을 커널에 먼저 넣어 두라는 뜻입니다. 이 정책에 맞는 패킷은 SA가 없으면 평문으로 나가지 않고 폐기되고, 커널이 데몬에게 협상을 요청합니다.
+
+이 한 줄을 `client.conf`에서 빼고 실행하면 `RESULT: FAIL`로 끝납니다. IKE SA가 끊긴 뒤와 사전공유키가 틀린 경우에, 정책이 없으니 요청이 평범한 패킷으로 취급되어 외부망에 평문으로 2개씩 나갔습니다(게이트웨이는 이 패킷을 `deny_no_tunnel`로 차단하지만, 외부망에서는 이미 보인 뒤입니다). IKE를 쓰면 "협상이 안 됐을 때 어떻게 되는가"가 설정에 달려 있습니다.
+
+### 한 호스트에 데몬 두 개
+
+strongSwan은 설정(`/etc/strongswan.conf`, `/etc/swanctl`)과 제어 소켓·PID 파일(`/run`)의 경로가 정해져 있어서, 그대로는 한 호스트에 두 개를 띄울 수 없습니다. 네임스페이스마다 이 경로가 다르게 보이도록 했습니다. `/etc`는 `ip netns exec`가 `/etc/netns/<이름>/` 아래 파일을 자동으로 덮어 보여 주는 기능을 썼고, `/run`은 데몬을 띄울 때 직접 마운트했습니다 → [lab/setup.sh](lab/setup.sh), [lab/sw.sh](lab/sw.sh)
+
 ## 장애 실험: SA가 없어지면 평문으로 유출되는가
 
-VPN에서 가장 피해야 할 실패는 "터널이 동작하지 않는데 요청이 평문으로 그대로 전송되는 것"입니다. 보안 정책(SP)은 그대로 두고 SA만 지워서 확인했습니다.
+VPN에서 가장 피해야 할 실패는 "터널이 동작하지 않는데 요청이 평문으로 그대로 전송되는 것"입니다. 네 가지 상황을 차례로 만들어 확인했습니다. (a)(b)는 보안 정책(SP)은 그대로 두고 커널의 SA만 지운 것이고, (c)는 IKE SA를 끊어 다시 협상하게 한 것, (d)는 클라이언트의 사전공유키를 다른 값으로 바꾼 것입니다.
 
 ```mermaid
 sequenceDiagram
@@ -166,19 +295,41 @@ sequenceDiagram
     Note over C: 정책은 있지만 쓸 SA가 없어 내보내지 않음 (XfrmOutNoStates)
     Note over N: 지나가는 패킷 0개
   end
+  rect rgba(21, 128, 61, 0.40)
+    Note over C,A: (c) IKE SA를 끊고 다시 요청
+    Note over C: 첫 패킷은 폐기, 커널이 데몬에 협상 요청
+    C->>G: IKE (인증, 새 SA 협상)
+    G->>C: IKE
+    C->>N: ESP (재전송된 요청)
+    N->>G: ESP
+    G->>A: 평문 요청
+  end
+  rect rgba(109, 40, 217, 0.40)
+    Note over C,A: (d) 사전공유키 불일치
+    Note over C: 첫 패킷은 폐기, 커널이 데몬에 협상 요청
+    C->>G: IKE (인증 시도)
+    G->>C: AUTHENTICATION_FAILED
+    Note over C: SA가 생기지 않아 계속 폐기
+    Note over A: 도착 0건
+  end
 ```
 
-| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 커널 통계 |
+| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 비고 |
 |---|---|---|---|---|---|
-| (a) 게이트웨이의 SA 삭제 | DROP | 2 | 0 | 0 | gw `XfrmInNoStates=2` |
-| (b) 클라이언트의 SA도 삭제 | DROP | 0 | 0 | 0 | client `XfrmOutNoStates=6` |
+| (a) 게이트웨이의 커널 SA 삭제 | DROP | 2 | 0 | 0 | gw `XfrmInNoStates=2` |
+| (b) 클라이언트의 커널 SA도 삭제 | DROP | 0 | 0 | 0 | client `XfrmOutNoStates=6`. 데몬은 SA가 1개 있다고 답함 |
+| (c) IKE SA를 끊고 다시 요청 | ALLOW | 12 | 0 | 7 | 외부망 IKE 메시지 4개 (재협상) |
+| (d) 사전공유키 불일치 | DROP | 0 | 0 | 0 | 외부망 IKE 메시지 4개, 인증 실패 기록 1건 |
 
-(로컬 Docker와 GitHub Actions에서 같은 값. 패킷 수는 재전송 횟수에 따라 달라질 수 있고, 검사는 "요청 실패, 평문 0건, app 도착 0건"만 봅니다.)
+(로컬 Docker 실행 값. 패킷 수는 재전송 횟수에 따라 달라질 수 있고, 검사는 「검사 항목」의 조건만 봅니다.)
 
 - (a) 클라이언트는 계속 암호화해 보냈지만(ESP 2개) 게이트웨이에 복호화할 SA가 없어 폐기했습니다. 암호문은 내부로 전달되지 않았습니다.
 - (b) 클라이언트는 "이 목적지는 ESP로 보내라"는 정책은 있는데 쓸 SA가 없어서, 패킷을 전송하지 않았습니다. 외부망에는 아무것도 지나가지 않았습니다.
-- 두 경우 모두 실패 시 차단(fail-closed)으로 동작했습니다. 대신 요청은 2초 시간 초과로 끝나고, 사용자에게는 이유가 보이지 않습니다. 원인은 커널 통계(`/proc/net/xfrm_stat`)에만 남습니다. 운영한다면 이 값을 모니터링해야 합니다.
-- 순서는 (a) 다음 (b)입니다. (b)는 게이트웨이 SA도 없는 상태에서 실행했습니다.
+- (a)(b)는 수동 키였을 때와 결과가 같습니다. IKE 데몬이 있어도 저절로 복구되지 않았습니다. 데몬은 자기가 넣은 SA가 커널에서 지워진 것을 알지 못해서, (b) 뒤에도 SA가 설치돼 있다고 답했습니다. 데몬이 아는 상태와 커널의 실제 상태가 어긋난 것입니다.
+- (c) IKE SA를 끊으면 데몬도 SA가 없다는 것을 알게 됩니다. 먼저 걸어 둔 정책이 남아 있어서, 다음 요청의 첫 패킷이 협상을 일으켰고 재전송된 패킷부터 새 SA로 전달됐습니다. 요청은 2초 안에 성공했습니다.
+- (d) 게이트웨이가 인증을 거부해(`AUTHENTICATION_FAILED`) SA가 생기지 않았습니다. 외부망에는 IKE 메시지만 지나갔고 ESP도 평문도 없었습니다.
+- 실패한 세 경우 모두 실패 시 차단(fail-closed)으로 동작했습니다. 대신 요청은 2초 시간 초과로 끝나고, 사용자에게는 이유가 보이지 않습니다. 원인은 커널 통계(`/proc/net/xfrm_stat`)와 데몬 로그(`out/ike_*.log`)에만 남습니다. 운영한다면 이 값을 모니터링해야 합니다.
+- 순서는 (a) → (b) → (c) → (d)입니다. (b)는 게이트웨이 SA도 없는 상태에서 실행했습니다.
 
 ## 만들면서 잘못 판단했던 것
 
@@ -192,7 +343,7 @@ sequenceDiagram
 
 ## 비교: 쿠버네티스 노드 간 투명 암호화 (Cilium IPsec)
 
-위 실습은 사용자 단말과 게이트웨이 사이에 SA와 키를 직접 넣는 **게이트웨이형**입니다. 같은 커널 기능(xfrm, ESP)을 쿠버네티스에서는 Cilium이 **노드와 노드 사이**에 겁니다. 파드는 암호화를 모르고, 설정은 Secret 하나와 설치 옵션 두 개입니다. 같은 질문을 던졌을 때 무엇이 같고 무엇이 다른지 실측했습니다.
+위 실습은 사용자 단말과 게이트웨이 사이에 터널을 거는 **게이트웨이형**입니다. 같은 커널 기능(xfrm, ESP)을 쿠버네티스에서는 Cilium이 **노드와 노드 사이**에 겁니다. 파드는 암호화를 모르고, 설정은 Secret 하나와 설치 옵션 두 개입니다. 같은 질문을 던졌을 때 무엇이 같고 무엇이 다른지 실측했습니다.
 
 kind로 노드 2개짜리 클러스터를 만들고 Cilium을 IPsec을 켠 채로 설치한 뒤, 파드 4개와 정책 1개를 올립니다 → [cilium/](cilium/), [run-cilium.sh](run-cilium.sh)
 
@@ -285,8 +436,8 @@ flowchart LR
 | 암호화 구간 | 사용자 단말 ↔ 게이트웨이 | 노드 ↔ 노드 |
 | 누가 암호화를 아는가 | 단말에 SA·정책·터널 안 주소가 있어야 함 | 파드는 모름. 노드의 커널이 처리 |
 | SA의 주소 | 단말과 게이트웨이의 바깥 주소 | 노드마다 정해진 주소 쌍. 파드별 SA 없음 |
-| SA·키를 넣는 주체 | 스크립트가 `ip xfrm`으로 직접. 방향별 키 2개 | Secret 하나를 주면 Cilium 에이전트가 각 노드에 SA를 설치 |
-| SPI | 방향마다 다름 (`0x1001`, `0x1002`) | 양방향 모두 `0x00000003` (Secret의 키 번호) |
+| SA·키를 넣는 주체 | 양쪽의 IKE 데몬(strongSwan)이 사전공유키로 인증하고 협상해서 설치. 방향별 키 2개 | Secret 하나를 주면 Cilium 에이전트가 각 노드에 SA를 설치 |
+| SPI | 방향마다 다르고, 협상할 때마다 바뀜 | 양방향 모두 `0x00000003` (Secret의 키 번호) |
 | 암호화 대상을 정하는 것 | 보안 정책(SP): `10.9.0.2 ↔ 10.0.2.0/23` | 목적지 파드가 다른 노드에 있는지 |
 | 바깥 구간 캡처 | ESP만, 터널 안 주소·포트 0건 | ESP만, 파드 주소·포트·요청 내용 0건 |
 | 암호화되지 않는 경로 | IPsec이 적용되지 않은 요청은 게이트웨이가 차단 (`DROP`) | 같은 노드의 파드 사이는 평문으로 전달 (`ALLOW`) |
@@ -294,7 +445,8 @@ flowchart LR
 | 요청자를 구분하는 기준 | 터널 안 주소 `10.9.0.2` | 파드 라벨 `role=client` |
 | 차단 기록 | nftables 카운터 (`deny_no_tunnel`, `deny_not_allowed`) + 패킷별 로그 | Cilium 통계 (`Policy denied`) |
 | SA가 없어졌을 때 | 실험함: 실패 시 차단 | 실험하지 않음 |
-| 실행 | 리눅스 네임스페이스, root | kind 클러스터, Docker |
+| 키 교체 | 실험함: 교체 뒤 SPI가 바뀌고 통신 유지 | 실험하지 않음 |
+| 실행 | 리눅스 네임스페이스 + strongSwan, root | kind 클러스터, Docker |
 
 가장 큰 차이는 "암호화되지 않는 경로"입니다. 게이트웨이형은 터널을 거치지 않으면 내부로 들어올 수 없게 만드는 것이 목적이라, IPsec이 적용되지 않은 요청을 차단합니다. 노드 간 투명 암호화는 노드 밖 구간의 도청을 막는 것이 목적이라, 같은 노드 안의 요청은 평문인 채로 허용합니다. 누가 무엇에 접근할 수 있는지는 두 경우 모두 암호화가 아니라 별도의 정책이 정합니다.
 
@@ -324,7 +476,9 @@ flowchart LR
 
 ## 한계
 
-- SA와 키를 스크립트가 직접 넣습니다. 키 교환(IKE), 키 교체, 사용자 인증이 없습니다. 사용자는 터널 안 주소 하나로만 식별됩니다.
+- 인증은 사전공유키(PSK) 하나입니다. IKE는 인증서로도 인증할 수 있지만 여기서는 다루지 않았습니다. 사용자별 인증(EAP 등)도 없어서, 사용자는 터널 안 주소 하나로만 식별됩니다.
+- 키 교체는 명령으로 한 번 시킨 것입니다. 수명이 다해 자동으로 교체되는 것, IKE SA 자체의 교체, 통신량이 많을 때의 교체는 확인하지 않았습니다.
+- 커널에서 SA만 지워진 경우는 저절로 복구되지 않습니다. 다시 협상하게 만들기 전까지 차단된 채로 남습니다.
 - 한 호스트 안의 네임스페이스입니다. 실제 NAT, MTU·단편화, 패킷 손실은 다루지 않습니다.
 - 게이트웨이는 한 대입니다. 이중화와 장애 전환은 없습니다.
 - 차단 로그는 실습이 도는 동안 파일로 받는 것까지입니다. 로그 수집 데몬, 보관·전송, 로그 폭주를 막는 속도 제한(`limit rate`)은 없습니다. 허용한 연결은 기록하지 않습니다.
