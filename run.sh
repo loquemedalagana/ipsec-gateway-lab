@@ -328,7 +328,14 @@ fold() {
   echo "| 대조군: 터널 없는 요청 | $ARP_S2 |"
   echo "| 공격자가 본 ESP | ${ARP_ESP}개 |"
   echo "| 공격자가 본 터널 안 평문 | ${ARP_LEAK}개 |"
-  echo "| 상태 | $ARP_NOTE |"; echo
+  if [ "$ARP_SPOOF_READY" -eq 1 ]; then
+    echo "| 동적 ARP: 캐시 변조 | 성공 (\`$ARP_BEFORE\` → \`$ARP_AFTER\`) |"
+    echo "| 정적 ARP 대응: 캐시 | 유지 (\`$ARP_STATIC\`) |"
+    echo "| 대조군: 공격자가 본 평문 | ${ARP_PLAIN_SEEN}개 |"
+  else
+    echo "| 상태 | $ARP_NOTE |"
+  fi
+  echo
 
   echo '## 장애 실험: SA 삭제 → 복구 → 인증 실패'
   echo '| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 비고 |'
