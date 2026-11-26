@@ -124,38 +124,83 @@ RK_IKE=$(n_ike rekey); RK_LEAK=$(n_leak rekey)
 # attacker 에게 가지 않는다. 아래 arp_spoof_start 에 거짓 ARP 를 보내는 명령을 직접 채우면,
 # 상대의 ARP 캐시가 공격자의 MAC 으로 바뀌어 트래픽이 attacker 를 거친다.
 # 채우기 전에는(ARP_SPOOF_READY=0) 판정을 건너뛴다 — 비어 있어도 CI 가 깨지지 않도록.
-ARP_SPOOF_READY=0
+ARP_SPOOF_READY=1
 
-arp_spoof_start() {   # TODO(직접 작성): attacker 에서 거짓 ARP 를 보내 경로에 끼어든다.
-  :   # 예) gw(10.0.1.1) 를 사칭해 client 의 캐시를 attacker 의 MAC 으로 덮는다.
-      #     요청을 이어가려면(S1 이 ALLOW) client(10.0.1.2) 사칭도 필요하다.
-      #     attacker 에는 ip_forward=1 이 이미 켜져 있다(setup.sh).
+arp_spoof_start() {
+  # client(10.0.1.2) ↔ gw(10.0.1.1) 양방향 ARP 스푸핑
+  ip netns exec attacker arpspoof -i atk0 -t 10.0.1.2 -r 10.0.1.1 >/dev/null 2>&1 &
+  ARP_PID=$!
 }
-arp_spoof_stop() {    # TODO(직접 작성): 거짓 ARP 전송을 멈추고 캐시를 되돌린다.
-  :
+
+arp_spoof_stop() {
+  if [ -n "${ARP_PID:-}" ]; then
+    kill -INT "$ARP_PID" 2>/dev/null || true
+    wait "$ARP_PID" 2>/dev/null || true
+    unset ARP_PID
+  fi
+  # 다음 단계(5-1, 6)에 영향이 없도록 양쪽 ARP 캐시 초기화
+  ip -n client neigh flush dev wan0 2>/dev/null || true
+  ip -n gw     neigh flush all      2>/dev/null || true
 }
 
 # attacker 쪽 캡처: 공격자가 자기 인터페이스에서 실제로 무엇을 보는지
 atk_cap_start() { ip netns exec attacker tcpdump -i atk0 -n -l > "$OUT/$1_atk.txt" 2>/dev/null & ATK_PID="$!"; sleep 1; }
-atk_cap_stop()  { sleep 1; kill $ATK_PID 2>/dev/null; sleep 0.5; }
+atk_cap_stop()  { sleep 1; kill "$ATK_PID" 2>/dev/null || true; sleep 0.5; }
 n_atk_esp()  { grep -c 'ESP(spi=' "$OUT/$1_atk.txt" || true; }                    # 공격자가 본 ESP
 n_atk_leak() { grep -c -e '10\.9\.0\.2' -e '\.8080' "$OUT/$1_atk.txt" || true; }  # 공격자가 본 터널 안 평문
 
-ARP_BEFORE=$(ip -n client neigh show 10.0.1.1 dev wan0 | awk '{print $5}')   # 공격 전 client 가 아는 gw 의 MAC
+# client 가 아는 gw(10.0.1.1)의 MAC. 주소로 필터하면 'dev' 가 빠져 필드가 당겨지므로 lladdr 다음 값을 집는다.
+gw_mac_at_client() { ip -n client neigh show 10.0.1.1 dev wan0 | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}'; }
+# 위조는 2초 간격으로 나가므로 한 번만 읽으면 주기와 어긋나 놓칠 수 있다.
+# 캐시가 바뀔 때까지 최대 ~8초, 0.5초마다 확인하고 바뀌면 즉시 반환한다(시간 초과 시 마지막 값).
+wait_mac_change() {  # wait_mac_change <기준 MAC>
+  local base="$1" cur=""
+  for _ in $(seq 16); do
+    cur=$(gw_mac_at_client)
+    [ -n "$cur" ] && [ "$cur" != "$base" ] && { echo "$cur"; return; }
+    sleep 0.5
+  done
+  echo "$cur"
+}
+ARP_BEFORE=$(gw_mac_at_client)        # 공격 전
 arp_spoof_start
-sleep 1
-ARP_AFTER=$(ip -n client neigh show 10.0.1.1 dev wan0 | awk '{print $5}')    # 공격 후 바뀌었는지
-atk_cap_start arp
-ARP_S1=$(outcome 10.9.0.2 http://10.0.2.10:8080/)    # 터널 요청: 공격자를 거쳐도 암호문만 보여야 한다
-ARP_S2=$(outcome 10.0.1.2 http://10.0.2.10:8080/)    # 대조군: 터널 없는 요청은 공격자에게 평문으로 보인다
+ARP_AFTER=$(wait_mac_change "$ARP_BEFORE")   # 위조가 캐시를 덮을 때까지 기다린다
+
+# 1) 실험군: 터널 요청만 캡처 (암호문 ESP만 보여야 함)
+atk_cap_start arp_tunnel
+ARP_S1=$(outcome 10.9.0.2 http://10.0.2.10:8080/)
 atk_cap_stop
+
+# 2) 대조군: 터널 없는 요청만 캡처 (평문이 보여야 함)
+atk_cap_start arp_plain
+ARP_S2=$(outcome 10.0.1.2 http://10.0.2.10:8080/)
+atk_cap_stop
+
 arp_spoof_stop
-ARP_ESP=$(n_atk_esp arp); ARP_LEAK=$(n_atk_leak arp)
+
+ARP_ESP=$(n_atk_esp arp_tunnel)
+ARP_LEAK=$(n_atk_leak arp_tunnel)
+ARP_PLAIN_SEEN=$(n_atk_leak arp_plain)
+
 if [ "$ARP_SPOOF_READY" -eq 1 ]; then
   [ -n "$ARP_AFTER" ] && [ "$ARP_AFTER" != "$ARP_BEFORE" ] || fail "(ARP) client 의 캐시가 공격자 MAC 으로 바뀌지 않았다 ($ARP_BEFORE → $ARP_AFTER)"
-  [ "$ARP_ESP" -gt 0 ]  || fail "(ARP) 공격자가 경로에 있는데 ESP 가 보이지 않는다"
-  [ "$ARP_LEAK" -eq 0 ] || fail "(ARP) 공격자에게 터널 안 주소·포트가 평문으로 보인다 — 기밀성 깨짐"
-  ARP_NOTE="client 캐시 $ARP_BEFORE → $ARP_AFTER (공격자 MAC 으로 바뀜)"
+  [ "$ARP_ESP" -gt 0 ]        || fail "(ARP) 공격자가 경로에 있는데 ESP 가 보이지 않는다"
+  [ "$ARP_LEAK" -eq 0 ]       || fail "(ARP) 공격자에게 터널 안 주소·포트가 평문으로 보인다 — 기밀성 깨짐"
+  [ "$ARP_PLAIN_SEEN" -gt 0 ] || fail "(ARP) 대조군(터널 없는 요청)의 평문이 공격자에게 보이지 않는다"
+
+  # ── 5-1. 정적 ARP 대응 검증 (static ARP 등록 후 재공격 시 MAC 유지 확인) ──
+  ip -n client neigh replace 10.0.1.1 lladdr "$ARP_BEFORE" dev wan0 nud permanent
+  arp_spoof_start
+  sleep 4            # 위조가 두 주기는 시도하도록 기다린 뒤, 그래도 안 바뀌었는지 본다(바뀌면 안 됨)
+  ARP_STATIC=$(gw_mac_at_client)
+  arp_spoof_stop
+
+  [ "$ARP_STATIC" = "$ARP_BEFORE" ] || fail "(ARP 대응) 정적 ARP를 걸었는데 MAC이 변조됐다 ($ARP_BEFORE → $ARP_STATIC)"
+
+  # 6단계 장애 실험을 위해 정적 엔트리 제거(동적 상태로 복구)
+  ip -n client neigh del 10.0.1.1 dev wan0 2>/dev/null || true
+
+  ARP_NOTE="동적 변조 확인($ARP_BEFORE → $ARP_AFTER), 대조군 평문 ${ARP_PLAIN_SEEN}개 노출 / 정적 ARP 대응 시 MAC 유지($ARP_STATIC)"
 else
   ARP_NOTE="미구현 — run.sh 의 arp_spoof_start/stop 을 채우고 ARP_SPOOF_READY=1 로 바꾸면 판정이 켜진다"
 fi
