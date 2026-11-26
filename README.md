@@ -17,6 +17,7 @@
 4. 차단은 이유와 함께, 무엇이 차단됐는지까지 기록되는가
 5. SA가 없어졌을 때 요청이 평문으로 유출되지 않는가
 6. 키를 사람이 넣지 않고 IKE로 협상해도 위 결과가 그대로인가 — 키를 바꿔도 통신이 이어지고, 인증에 실패하면 요청이 평문으로 나가지 않는가
+7. 외부망에서 ARP 스푸핑으로 공격자가 경로를 탈취해도 터널 안 내용은 지켜지는가, 대책을 걸면 탈취가 막히는가
 
 ## 구성
 
@@ -87,7 +88,7 @@ flowchart LR
 
 ## 실행
 
-GitHub Actions가 푸시마다 전체를 실행합니다. 실행 화면의 **Summary**에 IKE 협상 결과, 연결 매트릭스, 카운터, 차단 로그, 패킷 캡처, 키 교체, 장애 실험이 표시되고, 원본은 `evidence` 아티팩트로 남습니다.
+GitHub Actions가 푸시마다 전체를 실행합니다. 실행 화면의 **Summary** 맨 위에 검사별 통과/실패를 한눈에 보는 표가 있고, 그 아래 IKE 협상, 연결 매트릭스, 카운터, 차단 로그, 패킷 캡처, 키 교체, ARP 스푸핑, 장애 실험이 표시됩니다(긴 캡처는 접어 둡니다). 원본은 `evidence` 아티팩트로 남습니다.
 
 로컬(리눅스, root):
 
@@ -95,12 +96,16 @@ GitHub Actions가 푸시마다 전체를 실행합니다. 실행 화면의 **Sum
 sudo ./run.sh
 ```
 
-`iproute2`, `nftables`, `tcpdump`, `curl`, `python3`, `strongswan-charon`, `strongswan-swanctl`이 필요합니다. 실행하는 동안 `/etc/netns/client`, `/etc/netns/gw`, `/tmp/ipsec-gateway-lab`을 만들고, 끝나면 지웁니다.
+`iproute2`, `nftables`, `tcpdump`, `curl`, `python3`, `strongswan-charon`, `strongswan-swanctl`, `dsniff`(ARP 실험용)가 필요합니다. 실행하는 동안 `/etc/netns/client`, `/etc/netns/gw`, `/tmp/ipsec-gateway-lab`을 만들고, 끝나면 지웁니다.
 
-macOS에서는 Docker로 실행합니다.
+macOS에서는 Docker로 실행합니다. 저장소의 [Dockerfile](Dockerfile)로 이미지를 한 번 만들어 두고 실행합니다.
 
 ```bash
-docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update -qq && apt-get install -y -qq iproute2 nftables tcpdump curl python3 strongswan-charon strongswan-swanctl && /lab/run.sh'
+docker build -t ipsec-lab-dev .
+```
+
+```bash
+docker run --rm --privileged -v "$PWD":/lab -w /lab ipsec-lab-dev ./run.sh
 ```
 
 ## 검사 항목
@@ -119,6 +124,7 @@ docker run --rm --privileged -v "$PWD":/lab ubuntu:24.04 bash -c 'apt-get update
 | 카운터 | `allow_app`, `deny_no_tunnel`, `deny_not_allowed` 모두 0보다 큼 |
 | 차단 로그 | 차단한 3건이 이유에 맞는 파일에 있고, 허용한 요청은 0줄, 줄 수는 카운터와 같음 |
 | 키 교체 | 교체 뒤 요청 ALLOW, 새 SPI가 방향별 1개씩 생김, 외부망에 IKE 메시지가 있고 평문 0건 |
+| ARP 스푸핑 | 공격자가 경로를 탈취해도 공격자에게 터널 안 평문 0건, ESP는 보임, 대조군(터널 없는 요청)은 평문 노출, 정적 ARP 적용 시 캐시 유지 |
 | 장애 실험 (a)(b): 커널의 SA 삭제 | 요청 실패, 외부망 평문 0건, app 도착 0건 |
 | 장애 실험 (c): 다시 협상 | 요청 ALLOW, 외부망에 IKE 메시지가 있고 평문 0건 |
 | 장애 실험 (d): 사전공유키 불일치 | 요청 실패, 인증 실패 기록이 있고 IKE SA 0개, 외부망 ESP·평문 0건, app 도착 0건 |
@@ -331,6 +337,70 @@ sequenceDiagram
 - 실패한 세 경우 모두 실패 시 차단(fail-closed)으로 동작했습니다. 대신 요청은 2초 시간 초과로 끝나고, 사용자에게는 이유가 보이지 않습니다. 원인은 커널 통계(`/proc/net/xfrm_stat`)와 데몬 로그(`out/ike_*.log`)에만 남습니다. 운영한다면 이 값을 모니터링해야 합니다.
 - 순서는 (a) → (b) → (c) → (d)입니다. (b)는 게이트웨이 SA도 없는 상태에서 실행했습니다.
 
+## ARP 스푸핑: 경로에 끼어든 공격자가 무엇을 보는가
+
+ARP는 2계층 프로토콜이라 IPsec의 보호 대상이 아니고, 외부망 캡처 맨 앞에 평문으로 보입니다. 그러면 외부망에서 ARP를 속여 공격자가 경로에 끼어들었을 때, IPsec은 무엇을 지키고 무엇을 지키지 못하는지 확인했습니다.
+
+### 구성: 공격자를 외부망 브리지에 올린다
+
+외부망 브리지(`br0`)에 `attacker` 네임스페이스(`10.0.1.3`)를 세 번째 포트로 꽂았습니다. 브리지는 스위치라서, 학습이 끝나면 `client`와 `gw` 사이 유니캐스트를 두 포트로만 보냅니다. 그래서 그냥 꽂아 두는 것만으로는 공격자에게 터널 트래픽이 가지 않습니다. 공격자가 경로에 끼어들려면 거짓 ARP로 상대의 캐시를 자기 MAC으로 덮어야 합니다.
+
+`run.sh`의 ARP 절은 공격자가 `client`와 `gw` 양쪽을 속여 경로에 끼어든 뒤, 공격자 자신의 인터페이스(`atk0`)에서 캡처해 결과를 봅니다. 위조는 2초 간격으로 나가므로, 캐시가 바뀔 때까지 기다렸다가 확인합니다.
+
+```mermaid
+sequenceDiagram
+  participant C as client
+  participant X as attacker
+  participant G as gw
+  rect rgba(21, 128, 61, 0.30)
+    Note over C,G: 기준: 속이기 전
+    C->>G: ESP (br0 가 두 포트로만 전달)
+    Note over X: 아무것도 보지 못함
+  end
+  rect rgba(185, 28, 28, 0.35)
+    Note over C,G: 경로 탈취: 양쪽 ARP 캐시가 공격자 MAC 으로 바뀜
+    X-->>C: 거짓 ARP (gw 라고 사칭)
+    X-->>G: 거짓 ARP (client 라고 사칭)
+    Note over C: 캐시 10.0.1.1 → 공격자 MAC
+  end
+  rect rgba(29, 78, 216, 0.30)
+    Note over C,G: 터널 요청: 공격자를 거쳐도 암호문만 보임
+    C->>X: ESP
+    X->>G: ESP (그대로 전달)
+    Note over X: ESP 26개, 터널 안 평문 0건
+  end
+  rect rgba(217, 119, 6, 0.40)
+    Note over C,G: 대조군: 터널 없는 요청
+    C->>X: 평문 TCP
+    Note over X: 목적지 주소·포트가 그대로 보임
+  end
+  rect rgba(109, 40, 217, 0.30)
+    Note over C,G: 대책: 정적 ARP (permanent)
+    X-->>C: 거짓 ARP
+    Note over C: 위조 응답을 무시, 캐시 유지
+  end
+```
+
+### 결과
+
+| 항목 | 결과 |
+|---|---|
+| `client`의 ARP 캐시(`10.0.1.1`) | 공격자의 MAC으로 바뀜 — 경로 탈취 성공 |
+| 터널 요청 (`10.9.0.2 → app:8080`) | ALLOW — 공격자가 양방향으로 전달해 통신은 이어짐 |
+| 공격자가 본 ESP | 26개 — 공격자가 실제로 경로에 있음 |
+| 공격자가 본 터널 안 주소·포트·HTTP 내용 | **0건 — 기밀성이 지켜짐** |
+| 대조군: 터널 없는 요청을 공격자가 본 평문 | 1개 — IPsec이 없으면 목적지가 그대로 보임 |
+| 정적 ARP(`permanent`) 적용 후 재공격 | 캐시 유지 — 위조 응답을 무시 |
+
+(로컬 Docker 실행 값. MAC과 패킷 수는 실행마다 다릅니다.)
+
+핵심은 **공격자가 경로를 탈취했는데도 터널 안 내용은 평문으로 한 건도 보이지 않았다**는 것입니다. 공격자가 볼 수 있는 것은 암호문(ESP)과 바깥 주소뿐입니다. 반면 같은 공격 아래에서 터널 없이 보낸 대조군 요청은 목적지가 평문으로 드러났습니다. ARP 스푸핑으로 가능한 것은 가용성 공격(전달을 끊어 요청을 막는 것)과 트래픽 존재 파악까지입니다. 대책으로 정적 ARP를 걸면 위조 응답이 무시되어 경로 탈취 자체가 막혔습니다.
+
+### 한계 (이 실험 방식의)
+
+- 공격자가 패킷을 변조하거나 재전송했을 때(무결성·재전송 방지)는 이 절의 범위가 아닙니다. 설계상 ESP의 인증 태그와 replay window가 막지만, 실험은 다음 단계로 둡니다.
+- 대책은 정적 ARP 하나만 실험했습니다. 스위치의 DAI(Dynamic ARP Inspection)나 2계층을 암호화하는 MACsec은 장비 기능이라 이 환경에서는 재현하지 않았습니다.
+
 ## 만들면서 잘못 판단했던 것
 
 **닫힌 포트로는 정책을 검사할 수 없다.**
@@ -482,7 +552,7 @@ flowchart LR
 - 한 호스트 안의 네임스페이스입니다. 실제 NAT, MTU·단편화, 패킷 손실은 다루지 않습니다.
 - 게이트웨이는 한 대입니다. 이중화와 장애 전환은 없습니다.
 - 차단 로그는 실습이 도는 동안 파일로 받는 것까지입니다. 로그 수집 데몬, 보관·전송, 로그 폭주를 막는 속도 제한(`limit rate`)은 없습니다. 허용한 연결은 기록하지 않습니다.
-- ARP는 암호화 대상이 아니어서 외부망에 그대로 보입니다. 외부망에서 ARP 스푸핑을 했을 때 어떻게 되는지는 실험하지 않았습니다.
+- ARP는 암호화 대상이 아니어서 외부망에 그대로 보입니다. 공격자가 ARP 스푸핑으로 경로를 탈취해도 터널 안 내용은 평문으로 보이지 않음을 확인했지만(「ARP 스푸핑」 절), 공격자가 패킷을 변조·재전송했을 때(무결성·재전송 방지)는 다음 단계로 둡니다. 대책도 정적 ARP 하나만 실험했고 DAI·MACsec은 다루지 않았습니다.
 - 지연은 측정하지 않았습니다.
 
 ## AI 도구 사용

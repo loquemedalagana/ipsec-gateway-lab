@@ -119,7 +119,93 @@ RK_IKE=$(n_ike rekey); RK_LEAK=$(n_leak rekey)
 [ "$RK_IKE" -gt 0 ]                      || fail "외부망에 IKE 메시지가 보이지 않는다"
 [ "$RK_LEAK" -eq 0 ]                     || fail "키 교체 중 외부망에 평문이 보인다"
 
-# ── 5. 장애 실험: SA 가 사라지면 요청은 평문으로 새는가, 막히는가 ──
+# ── 5. ARP 스푸핑 관찰: 경로에 끼어든 공격자가 무엇을 보는가 ──
+# attacker 는 외부망 브리지(br0)에 함께 꽂혀 있다. 스위치라서 평소에는 client↔gw 유니캐스트가
+# attacker 에게 가지 않는다. 아래 arp_spoof_start 에 거짓 ARP 를 보내는 명령을 직접 채우면,
+# 상대의 ARP 캐시가 공격자의 MAC 으로 바뀌어 트래픽이 attacker 를 거친다.
+# 채우기 전에는(ARP_SPOOF_READY=0) 판정을 건너뛴다 — 비어 있어도 CI 가 깨지지 않도록.
+ARP_SPOOF_READY=1
+
+arp_spoof_start() {
+  # client(10.0.1.2) ↔ gw(10.0.1.1) 양방향 ARP 스푸핑
+  ip netns exec attacker arpspoof -i atk0 -t 10.0.1.2 -r 10.0.1.1 >/dev/null 2>&1 &
+  ARP_PID=$!
+}
+
+arp_spoof_stop() {
+  if [ -n "${ARP_PID:-}" ]; then
+    kill -INT "$ARP_PID" 2>/dev/null || true
+    wait "$ARP_PID" 2>/dev/null || true
+    unset ARP_PID
+  fi
+  # 다음 단계(5-1, 6)에 영향이 없도록 양쪽 ARP 캐시 초기화
+  ip -n client neigh flush dev wan0 2>/dev/null || true
+  ip -n gw     neigh flush all      2>/dev/null || true
+}
+
+# attacker 쪽 캡처: 공격자가 자기 인터페이스에서 실제로 무엇을 보는지
+atk_cap_start() { ip netns exec attacker tcpdump -i atk0 -n -l > "$OUT/$1_atk.txt" 2>/dev/null & ATK_PID="$!"; sleep 1; }
+atk_cap_stop()  { sleep 1; kill "$ATK_PID" 2>/dev/null || true; sleep 0.5; }
+n_atk_esp()  { grep -c 'ESP(spi=' "$OUT/$1_atk.txt" || true; }                    # 공격자가 본 ESP
+n_atk_leak() { grep -c -e '10\.9\.0\.2' -e '\.8080' "$OUT/$1_atk.txt" || true; }  # 공격자가 본 터널 안 평문
+
+# client 가 아는 gw(10.0.1.1)의 MAC. 주소로 필터하면 'dev' 가 빠져 필드가 당겨지므로 lladdr 다음 값을 집는다.
+gw_mac_at_client() { ip -n client neigh show 10.0.1.1 dev wan0 | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}'; }
+# 위조는 2초 간격으로 나가므로 한 번만 읽으면 주기와 어긋나 놓칠 수 있다.
+# 캐시가 바뀔 때까지 최대 ~8초, 0.5초마다 확인하고 바뀌면 즉시 반환한다(시간 초과 시 마지막 값).
+wait_mac_change() {  # wait_mac_change <기준 MAC>
+  local base="$1" cur=""
+  for _ in $(seq 16); do
+    cur=$(gw_mac_at_client)
+    [ -n "$cur" ] && [ "$cur" != "$base" ] && { echo "$cur"; return; }
+    sleep 0.5
+  done
+  echo "$cur"
+}
+ARP_BEFORE=$(gw_mac_at_client)        # 공격 전
+arp_spoof_start
+ARP_AFTER=$(wait_mac_change "$ARP_BEFORE")   # 위조가 캐시를 덮을 때까지 기다린다
+
+# 1) 실험군: 터널 요청만 캡처 (암호문 ESP만 보여야 함)
+atk_cap_start arp_tunnel
+ARP_S1=$(outcome 10.9.0.2 http://10.0.2.10:8080/)
+atk_cap_stop
+
+# 2) 대조군: 터널 없는 요청만 캡처 (평문이 보여야 함)
+atk_cap_start arp_plain
+ARP_S2=$(outcome 10.0.1.2 http://10.0.2.10:8080/)
+atk_cap_stop
+
+arp_spoof_stop
+
+ARP_ESP=$(n_atk_esp arp_tunnel)
+ARP_LEAK=$(n_atk_leak arp_tunnel)
+ARP_PLAIN_SEEN=$(n_atk_leak arp_plain)
+
+if [ "$ARP_SPOOF_READY" -eq 1 ]; then
+  [ -n "$ARP_AFTER" ] && [ "$ARP_AFTER" != "$ARP_BEFORE" ] || fail "(ARP) client 의 캐시가 공격자 MAC 으로 바뀌지 않았다 ($ARP_BEFORE → $ARP_AFTER)"
+  [ "$ARP_ESP" -gt 0 ]        || fail "(ARP) 공격자가 경로에 있는데 ESP 가 보이지 않는다"
+  [ "$ARP_LEAK" -eq 0 ]       || fail "(ARP) 공격자에게 터널 안 주소·포트가 평문으로 보인다 — 기밀성 깨짐"
+  [ "$ARP_PLAIN_SEEN" -gt 0 ] || fail "(ARP) 대조군(터널 없는 요청)의 평문이 공격자에게 보이지 않는다"
+
+  # ── 5-1. 정적 ARP 대응 검증 (static ARP 등록 후 재공격 시 MAC 유지 확인) ──
+  ip -n client neigh replace 10.0.1.1 lladdr "$ARP_BEFORE" dev wan0 nud permanent
+  arp_spoof_start
+  sleep 4            # 위조가 두 주기는 시도하도록 기다린 뒤, 그래도 안 바뀌었는지 본다(바뀌면 안 됨)
+  ARP_STATIC=$(gw_mac_at_client)
+  arp_spoof_stop
+
+  [ "$ARP_STATIC" = "$ARP_BEFORE" ] || fail "(ARP 대응) 정적 ARP를 걸었는데 MAC이 변조됐다 ($ARP_BEFORE → $ARP_STATIC)"
+
+  # 6단계 장애 실험을 위해 정적 엔트리 제거(동적 상태로 복구)
+  ip -n client neigh del 10.0.1.1 dev wan0 2>/dev/null || true
+
+  ARP_NOTE="동적 변조 확인($ARP_BEFORE → $ARP_AFTER), 대조군 평문 ${ARP_PLAIN_SEEN}개 노출 / 정적 ARP 대응 시 MAC 유지($ARP_STATIC)"
+else
+  ARP_NOTE="미구현 — run.sh 의 arp_spoof_start/stop 을 채우고 ARP_SPOOF_READY=1 로 바꾸면 판정이 켜진다"
+fi
+
+# ── 6. 장애 실험: SA 가 사라지면 요청은 평문으로 새는가, 막히는가 ──
 # 커널의 SA 만 지운다(정책은 그대로). 기대: 요청은 실패하고, 평문은 어디에도 나가지 않는다.
 # IKE 데몬은 커널에서 SA 가 지워진 것을 모른다. 그래서 데몬이 있어도 저절로 복구되지 않는다.
 # (a) 게이트웨이의 SA 만 삭제 — 클라이언트는 계속 암호화해 보내지만 게이트웨이가 풀 수 없다
@@ -176,30 +262,81 @@ F4_SA=$(sw client --list-sas | grep -c 'ESTABLISHED' || true)
 cp "$RUN/client/charon.log" "$OUT/ike_client.log"; cp "$RUN/gw/charon.log" "$OUT/ike_gw.log"
 
 # ── 요약 (GitHub Actions 요약 화면에 그대로 붙인다) ──
+# 각 검사의 통과/실패를 실제 값으로 판정해 맨 위 "한눈에 보기" 표에 쓴다.
+m_ike=✅; { [ "$IKE_C" -eq 1 ] && [ "$IKE_G" -eq 1 ] && [ "$SPI_C" = "$SPI_G" ]; } || m_ike=❌
+m_mat=✅; if grep -q MISMATCH "$OUT/matrix.md"; then m_mat=❌; fi
+MAT_OK=$(grep -c '| ok |' "$OUT/matrix.md" || true)
+m_cnt=✅; { [ "${A:-0}" -gt 0 ] && [ "${N:-0}" -gt 0 ] && [ "${D:-0}" -gt 0 ]; } || m_cnt=❌
+m_log=✅; { [ "$L_N" -eq "${N:-0}" ] && [ "$L_D" -eq "${D:-0}" ] && [ "$L_ALLOWED" -eq 0 ]; } || m_log=❌
+m_rk=✅;  { [ "$RK" = ALLOW ] && [ "$RK_LEAK" -eq 0 ]; } || m_rk=❌
+if [ "$ARP_SPOOF_READY" -eq 1 ]; then
+  m_arp=✅; { [ "$ARP_LEAK" -eq 0 ] && [ "$ARP_ESP" -gt 0 ] && [ "$ARP_AFTER" != "$ARP_BEFORE" ]; } || m_arp=❌
+else
+  m_arp=⏭️
+fi
+m_flt=✅; { [ "$F1" != ALLOW ] && [ "$F2" != ALLOW ] && [ "$F3" = ALLOW ] && [ "$F4" != ALLOW ] \
+  && [ "$F1_LEAK" -eq 0 ] && [ "$F2_LEAK" -eq 0 ] && [ "$F3_LEAK" -eq 0 ] && [ "$F4_LEAK" -eq 0 ]; } || m_flt=❌
+[ "$FAIL" -eq 0 ] && banner='✅ PASS' || banner='❌ FAIL'
+
+# 긴 캡처·덤프를 접는다: fold <제목> <파일> [줄수]  (파일 내용을 <details> 안 코드블록으로)
+fold() {
+  echo "<details><summary>$1</summary>"; echo
+  echo '```'; head -"${3:-8}" "$2"; echo '```'; echo
+  echo '</details>'; echo
+}
 {
+  echo "# 검사 결과: $banner"; echo
+  echo '| 검사 | 상태 | 요약 |'; echo '|---|---|---|'
+  echo "| IKE 협상 | $m_ike | 양쪽 데몬 ESTABLISHED, SPI 일치 |"
+  echo "| 연결 매트릭스 | $m_mat | ${MAT_OK}/4 통과 |"
+  echo "| 차단 카운터 | $m_cnt | allow $A / no_tunnel $N / not_allowed $D |"
+  echo "| 차단 로그(건별) | $m_log | 카운터와 줄 수 일치, 허용 요청 0줄 |"
+  echo "| 키 교체 | $m_rk | $RK, 외부망 평문 ${RK_LEAK}개 |"
+  echo "| ARP 스푸핑 | $m_arp | 공격자 평문 ${ARP_LEAK}개, ESP ${ARP_ESP}개 |"
+  echo "| 장애 실험 | $m_flt | (a)(b) 차단 / (c) 복구 / (d) 인증거부 |"
+  echo
+  echo '> DROP = 시간 초과(패킷 폐기), REFUSED = 연결 거부(포트 닫힘). 정책이 막으면 DROP.'; echo
+
   echo '## IKE 협상 (strongSwan, IKEv2, 사전공유키)'
   echo "IKE SA 수립: client ${IKE_C}개, gw ${IKE_G}개. 커널의 SPI(양쪽 동일): \`${SPI_C% }\`"
-  echo '```'; sed -n '/^# gw/,$p' "$OUT/ike_sas.txt"; echo '```'
+  fold 'IKE SA 상세 (swanctl --list-sas)' /dev/stdin 999 <<< "$(sed -n '/^# gw/,$p' "$OUT/ike_sas.txt")"
+
   echo '## 연결 매트릭스'; cat "$OUT/matrix.md"; echo
-  echo 'DROP = 시간 초과(패킷이 폐기됨), REFUSED = 연결 거부(포트가 닫힘). 정책이 차단하면 DROP 이어야 한다.'; echo
+
   echo '## 차단·허용 카운터 (게이트웨이 nftables)'
   echo '| 카운터 | 패킷 수 |'; echo '|---|---|'
   echo "| allow_app | $A |"; echo "| deny_no_tunnel | $N |"; echo "| deny_not_allowed | $D |"; echo
+
   echo "## 차단 로그 (건별): deny_no_tunnel ${L_N}줄, deny_not_allowed ${L_D}줄, 허용한 요청 ${L_ALLOWED}줄"
-  echo 'deny_no_tunnel (IPsec 이 적용되지 않은 패킷)'
-  echo '```'; head -8 "$OUT/drop_no_tunnel.txt"; echo '```'
-  echo 'deny_not_allowed (터널로 들어왔지만 허용 목록에 없는 목적지)'
-  echo '```'; head -8 "$OUT/drop_not_allowed.txt"; echo '```'
+  fold 'deny_no_tunnel (IPsec 이 적용되지 않은 패킷)' "$OUT/drop_no_tunnel.txt"
+  fold 'deny_not_allowed (터널로 들어왔지만 허용 목록에 없는 목적지)' "$OUT/drop_not_allowed.txt"
+
   echo "## 패킷 캡처: 외부망 (br0) — ESP ${ESP}개, 평문 노출 ${LEAK}개"
-  echo '```'; head -8 "$OUT/capture_wan.txt"; echo '```'
+  fold '외부망 캡처 원문' "$OUT/capture_wan.txt"
   echo "## 패킷 캡처: 터널 안쪽 (gw-app) — 복호화된 요청 ${PLAIN}개"
-  echo '```'; head -8 "$OUT/capture_inside.txt"; echo '```'
+  fold '안쪽 캡처 원문' "$OUT/capture_inside.txt"
+
   echo '## 키 교체 (rekey)'
   echo "요청 결과 $RK, 외부망 IKE 메시지 ${RK_IKE}개, 외부망 평문 ${RK_LEAK}개"; echo
   echo "| | SPI |"; echo '|---|---|'
   echo "| 교체 전 | \`${SPI_OLD% }\` |"; echo "| 새로 생긴 것 | \`${SPI_NEW% }\` |"; echo
-  echo '외부망에서 본 IKE 메시지 (내용은 암호화되어 종류만 보인다)'
-  echo '```'; grep 'isakmp' "$OUT/rekey_wan.txt" | head -4; echo '```'
+  fold '외부망에서 본 IKE 메시지 (내용은 암호화되어 종류만 보인다)' /dev/stdin 4 <<< "$(grep 'isakmp' "$OUT/rekey_wan.txt")"
+
+  echo '## ARP 스푸핑 관찰 (온패스 공격자)'
+  echo "| 항목 | 값 |"; echo '|---|---|'
+  echo "| 터널 요청(공격자 경유) | $ARP_S1 |"
+  echo "| 대조군: 터널 없는 요청 | $ARP_S2 |"
+  echo "| 공격자가 본 ESP | ${ARP_ESP}개 |"
+  echo "| 공격자가 본 터널 안 평문 | ${ARP_LEAK}개 |"
+  if [ "$ARP_SPOOF_READY" -eq 1 ]; then
+    echo "| 동적 ARP: 캐시 변조 | 성공 (\`$ARP_BEFORE\` → \`$ARP_AFTER\`) |"
+    echo "| 정적 ARP 대응: 캐시 | 유지 (\`$ARP_STATIC\`) |"
+    echo "| 대조군: 공격자가 본 평문 | ${ARP_PLAIN_SEEN}개 |"
+  else
+    echo "| 상태 | $ARP_NOTE |"
+  fi
+  echo
+
   echo '## 장애 실험: SA 삭제 → 복구 → 인증 실패'
   echo '| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 비고 |'
   echo '|---|---|---|---|---|---|'
@@ -208,8 +345,7 @@ cp "$RUN/client/charon.log" "$OUT/ike_client.log"; cp "$RUN/gw/charon.log" "$OUT
   echo "| (c) IKE SA 를 끊고 다시 요청 | $F3 | $F3_ESP | $F3_LEAK | $F3_IN | 외부망 IKE 메시지 ${F3_IKE}개 (재협상) |"
   echo "| (d) 사전공유키 불일치 | $F4 | $F4_ESP | $F4_LEAK | $F4_IN | 외부망 IKE 메시지 ${F4_IKE}개, 인증 실패 기록 ${F4_AUTH}건 |"
   echo
-  echo '## IPsec SA (게이트웨이, 키 교체·장애 실험 전, 키 생략)'
-  echo '```'; cat "$OUT/xfrm_state.txt"; echo '```'
+  fold 'IPsec SA (게이트웨이, 키 교체·장애 실험 전, 키 생략)' "$OUT/xfrm_state.txt" 999
 } > "$OUT/summary.md"
 cat "$OUT/summary.md"
 

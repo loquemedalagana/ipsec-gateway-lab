@@ -11,10 +11,11 @@ set -euo pipefail
 
 CLIENT_WAN=10.0.1.2   # 터널 바깥(외부) 주소
 GW_WAN=10.0.1.1
+ATTACKER_WAN=10.0.1.3 # 외부망에 함께 꽂는 제3자(온패스 공격자 자리)
 CLIENT_VIP=10.9.0.2   # 터널 안에서 쓰는 주소
 INSIDE=10.0.2.0/23    # 보호 대상 대역 (10.0.2.0/24 + 10.0.3.0/24)
 
-for ns in client net gw app db; do
+for ns in client net gw app db attacker; do
   ip netns add "$ns"
   ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
   ip -n "$ns" link set lo up
@@ -34,6 +35,13 @@ ip -n net link set p-client master br0 up
 ip -n net link set p-gw     master br0 up
 ip -n client addr add "$CLIENT_WAN/24" dev wan0;   ip -n client link set wan0 up
 ip -n gw     addr add "$GW_WAN/24"     dev gw-wan; ip -n gw     link set gw-wan up
+# attacker 를 br0 에 세 번째 포트로 꽂는다. 스위치(br0)는 학습이 끝나면 유니캐스트를
+# 목적지 포트로만 보내므로, 평소에는 attacker 에게 client↔gw 트래픽이 가지 않는다.
+# attacker 가 경로에 끼어들려면 거짓 ARP 로 상대의 캐시를 틀어야 한다(run.sh 의 ARP 절).
+ip link add atk0 netns attacker type veth peer name p-atk netns net
+ip -n net      link set p-atk master br0 up
+ip -n attacker addr add "$ATTACKER_WAN/24" dev atk0; ip -n attacker link set atk0 up
+ip netns exec attacker sysctl -qw net.ipv4.ip_forward=1   # MITM 으로 통신을 이어가려면 전달이 필요하다
 link gw     gw-app 10.0.2.1/24      app eth0   10.0.2.10/24
 link gw     gw-db  10.0.3.1/24      db  eth0   10.0.3.20/24
 
