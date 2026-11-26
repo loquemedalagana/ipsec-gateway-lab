@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 전체 실행: 구성 → 패킷 캡처 → 연결 매트릭스 → 차단 기록(카운터·건별 로그) → 장애 실험 → 정리.
+# 전체 실행: 구성(IKE 협상) → 패킷 캡처 → 연결 매트릭스 → 차단 기록(카운터·건별 로그) → 키 교체 → 장애 실험 → 정리.
 # 검사가 하나라도 어긋나면 0이 아닌 값으로 끝난다(CI 실패).
 # 결과는 out/ 에 남는다. root 권한이 필요하다(sudo ./run.sh).
 set -euo pipefail
@@ -11,6 +11,9 @@ fail() { echo "FAIL: $*"; FAIL=1; }
 lab/teardown.sh
 trap lab/teardown.sh EXIT
 lab/setup.sh
+RUN=/tmp/ipsec-gateway-lab
+sw() { lab/sw.sh "$@"; }   # IKE 데몬에 명령을 보낸다: sw <ns> <명령> [옵션...]
+spis() { ip -n "$1" xfrm state | awk '$1=="proto" {print $4}' | sort | tr '\n' ' '; }   # 커널에 있는 SA 의 SPI 목록
 
 # 요청 한 번을 보내고 결과를 한 단어로 돌려준다: outcome <출발 주소> <url>
 #   ALLOW   = 응답을 받음
@@ -28,24 +31,35 @@ check() { # check <설명> <기대값> <출발 주소> <url>
 }
 
 # 같은 요청을 외부망(net 의 br0)과 터널 안쪽(gw-app)에서 동시에 캡처한다
+# 캡처를 끌 때는 캡처 프로세스만 끈다(gw 에는 IKE 데몬도 돌고 있다)
 cap_start() { # cap_start <파일 이름 앞부분>
-  ip netns exec net tcpdump -i br0    -n -l > "$OUT/$1_wan.txt"    2>/dev/null &
-  ip netns exec gw  tcpdump -i gw-app -n -l > "$OUT/$1_inside.txt" 2>/dev/null &
+  ip netns exec net tcpdump -i br0    -n -l > "$OUT/$1_wan.txt"    2>/dev/null & CAP_PIDS="$!"
+  ip netns exec gw  tcpdump -i gw-app -n -l > "$OUT/$1_inside.txt" 2>/dev/null & CAP_PIDS="$CAP_PIDS $!"
   sleep 1
 }
-cap_stop() { sleep 1; { ip netns pids net; ip netns pids gw; } | xargs -r kill; sleep 0.5; }
+cap_stop() { sleep 1; kill $CAP_PIDS; sleep 0.5; }
 n_esp()   { grep -c 'ESP(spi=' "$OUT/$1_wan.txt" || true; }                       # 외부망의 ESP 패킷 수
 n_leak()  { grep -c -e '10\.9\.0\.2' -e '\.8080' "$OUT/$1_wan.txt" || true; }     # 외부망에 평문으로 보인 수
 n_plain() { grep -c '> 10\.0\.2\.10\.8080' "$OUT/$1_inside.txt" || true; }        # app 에 도착한 요청 패킷 수
+n_ike()   { grep -c 'isakmp' "$OUT/$1_wan.txt" || true; }                         # 외부망의 IKE 메시지 수 (UDP 500)
 # 게이트웨이가 차단한 패킷의 건별 로그: nftables 가 nflog 그룹으로 보낸 것을 이유별 파일로 받는다
 log_start() {
-  ip netns exec gw tcpdump -i nflog:1 -n -l > "$OUT/drop_no_tunnel.txt"   2>/dev/null &
-  ip netns exec gw tcpdump -i nflog:2 -n -l > "$OUT/drop_not_allowed.txt" 2>/dev/null &
+  ip netns exec gw tcpdump -i nflog:1 -n -l > "$OUT/drop_no_tunnel.txt"   2>/dev/null & LOG_PIDS="$!"
+  ip netns exec gw tcpdump -i nflog:2 -n -l > "$OUT/drop_not_allowed.txt" 2>/dev/null & LOG_PIDS="$LOG_PIDS $!"
   sleep 1
 }
-log_stop() { sleep 1; ip netns pids gw | xargs -r kill; sleep 0.5; }
+log_stop() { sleep 1; kill $LOG_PIDS; sleep 0.5; }
 n_log() { grep -c -E "$2" "$OUT/$1.txt" || true; }   # n_log <파일 이름> <정규식>: 맞는 로그 줄 수
 xstat()   { ip netns exec "$1" cat /proc/net/xfrm_stat | awk '$2>0 {printf "%s=%s ", $1, $2} END {print ""}'; }
+
+# ── 0. IKE: 양쪽 데몬이 서로를 인증하고 SA 를 협상해 커널에 넣었는지 ──
+{ echo '# client'; sw client --list-sas; echo; echo '# gw'; sw gw --list-sas; } > "$OUT/ike_sas.txt"
+IKE_C=$(sw client --list-sas | grep -c 'ESTABLISHED, IKEv2' || true)
+IKE_G=$(sw gw     --list-sas | grep -c 'ESTABLISHED, IKEv2' || true)
+SPI_C=$(spis client); SPI_G=$(spis gw)
+[ "$IKE_C" -eq 1 ] && [ "$IKE_G" -eq 1 ] || fail "IKE SA 가 수립되지 않았다 (client=$IKE_C gw=$IKE_G)"
+[ "$(echo $SPI_C | wc -w)" -eq 2 ]       || fail "커널의 SA 가 방향별 하나씩(2개)이 아니다: $SPI_C"
+[ "$SPI_C" = "$SPI_G" ]                  || fail "양쪽 커널의 SPI 가 다르다 (client: $SPI_C / gw: $SPI_G)"
 
 # ── 1. 패킷 캡처 ──
 cap_start capture
@@ -90,8 +104,24 @@ L_ALLOWED=$(cat "$OUT"/drop_*.txt | grep -c -E '10\.9\.0\.2\.[0-9]+ > 10\.0\.2\.
 ip -n gw xfrm state | sed -E 's/0x[0-9a-f]{16,}/(key 생략)/' > "$OUT/xfrm_state.txt"
 ip -n gw xfrm policy > "$OUT/xfrm_policy.txt"
 
-# ── 4. 장애 실험: SA 가 사라지면 요청은 평문으로 새는가, 막히는가 ──
-# 정책(SP)은 그대로 두고 SA 만 지운다. 기대: 요청은 실패하고, 평문은 어디에도 나가지 않는다.
+# ── 4. 키 교체(rekey): 새 키로 바꿔도 통신이 이어지는가 ──
+# 수동 키에서는 할 수 없던 일이다. CHILD SA 를 다시 협상시키고, SPI 가 바뀌었는지와 요청이 여전히 되는지를 본다.
+SPI_OLD=$(spis client)
+cap_start rekey
+sw client --rekey --child inside > "$OUT/ike_rekey.txt" 2>&1 || fail "rekey 명령 실패"
+sleep 1
+RK=$(outcome 10.9.0.2 http://10.0.2.10:8080/)
+cap_stop
+SPI_NEW=$(for x in $(spis client); do echo " $SPI_OLD" | grep -q " $x " || printf '%s ' "$x"; done)   # 이전 목록에 없던 SPI
+RK_IKE=$(n_ike rekey); RK_LEAK=$(n_leak rekey)
+[ "$RK" = ALLOW ]                        || fail "키 교체 뒤 요청이 실패했다 ($RK)"
+[ "$(echo $SPI_NEW | wc -w)" -eq 2 ]     || fail "키 교체 뒤 새 SPI 가 방향별 하나씩 생기지 않았다 (이전: $SPI_OLD / 새로 생긴 것: $SPI_NEW)"
+[ "$RK_IKE" -gt 0 ]                      || fail "외부망에 IKE 메시지가 보이지 않는다"
+[ "$RK_LEAK" -eq 0 ]                     || fail "키 교체 중 외부망에 평문이 보인다"
+
+# ── 5. 장애 실험: SA 가 사라지면 요청은 평문으로 새는가, 막히는가 ──
+# 커널의 SA 만 지운다(정책은 그대로). 기대: 요청은 실패하고, 평문은 어디에도 나가지 않는다.
+# IKE 데몬은 커널에서 SA 가 지워진 것을 모른다. 그래서 데몬이 있어도 저절로 복구되지 않는다.
 # (a) 게이트웨이의 SA 만 삭제 — 클라이언트는 계속 암호화해 보내지만 게이트웨이가 풀 수 없다
 ip -n gw xfrm state flush
 cap_start fault_gw
@@ -111,9 +141,45 @@ F2_ESP=$(n_esp fault_client); F2_LEAK=$(n_leak fault_client); F2_IN=$(n_plain fa
 [ "$F2" != ALLOW ]    || fail "(b) SA 가 없는데 요청이 성공했다"
 [ "$F2_LEAK" -eq 0 ]  || fail "(b) 외부망에 평문이 보인다 — 실패 시 열림"
 [ "$F2_IN" -eq 0 ]    || fail "(b) 요청이 app 까지 갔다"
+F2_DAEMON=$(sw client --list-sas | grep -c 'INSTALLED' || true)   # 데몬은 SA 가 아직 있다고 본다
+
+# (c) 복구 — IKE SA 를 끊는다. 걸어 둔 정책(trap)이 남아 있어서, 다음 요청이 오면 데몬이 처음부터 다시 협상한다
+sw client --terminate --ike gw > "$OUT/ike_terminate.txt" 2>&1 || true
+cap_start recover
+F3=$(outcome 10.9.0.2 http://10.0.2.10:8080/)
+cap_stop
+F3_ESP=$(n_esp recover); F3_LEAK=$(n_leak recover); F3_IN=$(n_plain recover); F3_IKE=$(n_ike recover)
+[ "$F3" = ALLOW ]     || fail "(c) 다시 협상한 뒤에도 요청이 실패했다 ($F3)"
+[ "$F3_IKE" -gt 0 ]   || fail "(c) 외부망에 재협상(IKE)이 보이지 않는다"
+[ "$F3_LEAK" -eq 0 ]  || fail "(c) 재협상 중 외부망에 평문이 보인다"
+
+# (d) 인증 실패 — 클라이언트의 사전공유키를 다른 값으로 바꾸고 다시 협상하게 한다
+# 기대: 게이트웨이가 인증을 거부해 SA 가 생기지 않고, 요청은 평문으로 나가지 않고 버려진다.
+sw client --terminate --ike gw >> "$OUT/ike_terminate.txt" 2>&1 || true
+printf 'secrets { ike-lab {\n id-1 = client\n id-2 = gw\n secret = 0x%s\n} }\n' "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')" \
+  > /etc/netns/client/swanctl/wrong.conf
+sw client --load-creds --clear --file /etc/swanctl/wrong.conf > /dev/null 2>&1 || fail "(d) 키를 바꿔 넣지 못했다"
+cap_start fault_psk
+F4=$(outcome 10.9.0.2 http://10.0.2.10:8080/)
+cap_stop
+F4_ESP=$(n_esp fault_psk); F4_LEAK=$(n_leak fault_psk); F4_IN=$(n_plain fault_psk); F4_IKE=$(n_ike fault_psk)
+F4_AUTH=$(grep -c 'AUTHENTICATION_FAILED' "$RUN/client/charon.log" || true)
+F4_SA=$(sw client --list-sas | grep -c 'ESTABLISHED' || true)
+[ "$F4" != ALLOW ]    || fail "(d) 키가 틀린데 요청이 성공했다"
+[ "$F4_AUTH" -gt 0 ]  || fail "(d) 인증 실패 기록이 없다"
+[ "$F4_SA" -eq 0 ]    || fail "(d) 키가 틀린데 IKE SA 가 수립됐다"
+[ "$F4_ESP" -eq 0 ]   || fail "(d) SA 가 없는데 외부망에 ESP 가 보인다"
+[ "$F4_LEAK" -eq 0 ]  || fail "(d) 외부망에 평문이 보인다 — 실패 시 열림"
+[ "$F4_IN" -eq 0 ]    || fail "(d) 요청이 app 까지 갔다"
+
+# IKE 데몬 로그를 증거로 남긴다(로그 수준 1: 키는 찍히지 않는다)
+cp "$RUN/client/charon.log" "$OUT/ike_client.log"; cp "$RUN/gw/charon.log" "$OUT/ike_gw.log"
 
 # ── 요약 (GitHub Actions 요약 화면에 그대로 붙인다) ──
 {
+  echo '## IKE 협상 (strongSwan, IKEv2, 사전공유키)'
+  echo "IKE SA 수립: client ${IKE_C}개, gw ${IKE_G}개. 커널의 SPI(양쪽 동일): \`${SPI_C% }\`"
+  echo '```'; sed -n '/^# gw/,$p' "$OUT/ike_sas.txt"; echo '```'
   echo '## 연결 매트릭스'; cat "$OUT/matrix.md"; echo
   echo 'DROP = 시간 초과(패킷이 폐기됨), REFUSED = 연결 거부(포트가 닫힘). 정책이 차단하면 DROP 이어야 한다.'; echo
   echo '## 차단·허용 카운터 (게이트웨이 nftables)'
@@ -128,13 +194,21 @@ F2_ESP=$(n_esp fault_client); F2_LEAK=$(n_leak fault_client); F2_IN=$(n_plain fa
   echo '```'; head -8 "$OUT/capture_wan.txt"; echo '```'
   echo "## 패킷 캡처: 터널 안쪽 (gw-app) — 복호화된 요청 ${PLAIN}개"
   echo '```'; head -8 "$OUT/capture_inside.txt"; echo '```'
-  echo '## 장애 실험: SA 삭제 (정책은 유지)'
-  echo '| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 커널 xfrm 통계 (0 아닌 것) |'
+  echo '## 키 교체 (rekey)'
+  echo "요청 결과 $RK, 외부망 IKE 메시지 ${RK_IKE}개, 외부망 평문 ${RK_LEAK}개"; echo
+  echo "| | SPI |"; echo '|---|---|'
+  echo "| 교체 전 | \`${SPI_OLD% }\` |"; echo "| 새로 생긴 것 | \`${SPI_NEW% }\` |"; echo
+  echo '외부망에서 본 IKE 메시지 (내용은 암호화되어 종류만 보인다)'
+  echo '```'; grep 'isakmp' "$OUT/rekey_wan.txt" | head -4; echo '```'
+  echo '## 장애 실험: SA 삭제 → 복구 → 인증 실패'
+  echo '| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 비고 |'
   echo '|---|---|---|---|---|---|'
-  echo "| (a) 게이트웨이 SA 삭제 | $F1 | $F1_ESP | $F1_LEAK | $F1_IN | gw: $F1_STAT |"
-  echo "| (b) 클라이언트 SA 도 삭제 | $F2 | $F2_ESP | $F2_LEAK | $F2_IN | client: $F2_STAT |"
+  echo "| (a) 게이트웨이의 커널 SA 삭제 | $F1 | $F1_ESP | $F1_LEAK | $F1_IN | gw 커널 통계: $F1_STAT |"
+  echo "| (b) 클라이언트의 커널 SA 도 삭제 | $F2 | $F2_ESP | $F2_LEAK | $F2_IN | client 커널 통계: $F2_STAT / 데몬이 아는 SA: ${F2_DAEMON}개 |"
+  echo "| (c) IKE SA 를 끊고 다시 요청 | $F3 | $F3_ESP | $F3_LEAK | $F3_IN | 외부망 IKE 메시지 ${F3_IKE}개 (재협상) |"
+  echo "| (d) 사전공유키 불일치 | $F4 | $F4_ESP | $F4_LEAK | $F4_IN | 외부망 IKE 메시지 ${F4_IKE}개, 인증 실패 기록 ${F4_AUTH}건 |"
   echo
-  echo '## IPsec SA (게이트웨이, 장애 실험 전, 키 생략)'
+  echo '## IPsec SA (게이트웨이, 키 교체·장애 실험 전, 키 생략)'
   echo '```'; cat "$OUT/xfrm_state.txt"; echo '```'
 } > "$OUT/summary.md"
 cat "$OUT/summary.md"

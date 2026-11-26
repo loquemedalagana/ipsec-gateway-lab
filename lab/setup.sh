@@ -6,7 +6,7 @@
 #   터널 안 주소 10.9.0.2
 #
 # net 은 둘 사이의 "선" 역할만 하는 브리지다. 제3자가 보는 패킷을 여기서 캡처한다.
-# client 와 gw 사이에는 IPsec ESP 터널 모드를 건다(수동 SA, IKE 없음).
+# client 와 gw 사이에는 IPsec ESP 터널 모드를 건다. SA 는 IKEv2(strongSwan)가 협상해서 넣는다.
 set -euo pipefail
 
 CLIENT_WAN=10.0.1.2   # 터널 바깥(외부) 주소
@@ -47,24 +47,40 @@ ip -n client link set vip0 up
 ip -n client route add "$INSIDE" via "$GW_WAN" src "$CLIENT_VIP"
 ip -n gw route add "$CLIENT_VIP/32" via "$CLIENT_WAN"
 
-# IPsec SA(보안 연관): 방향마다 하나씩. 키는 실행할 때마다 새로 만들고 출력하지 않는다.
-# AES-GCM: 키 16바이트 + salt 4바이트 = 20바이트, 무결성 값(ICV) 128비트
-key() { echo "0x$(od -An -tx1 -N20 /dev/urandom | tr -d ' \n')"; }
-K_C2G=$(key); K_G2C=$(key)
+# IPsec: 키와 SA 를 직접 넣지 않는다. client 와 gw 에 IKE 데몬(strongSwan charon)을 하나씩 띄워 협상하게 한다.
+# 한 호스트에 데몬이 둘이라, 데몬이 쓰는 고정 경로를 네임스페이스마다 따로 보이게 한다.
+#   /etc/strongswan.conf, /etc/swanctl  ← /etc/netns/<ns>/ 아래 것 (ip netns exec 가 자동으로 덮어 보여 준다)
+#   /run (제어 소켓·PID·로그)            ← $RUN/<ns> (실행할 때 직접 마운트)
+HERE=$(cd "$(dirname "$0")" && pwd)
+RUN=/tmp/ipsec-gateway-lab
+sw() { "$HERE/sw.sh" "$@"; }   # 데몬에 명령을 보낸다: sw <ns> <명령> [옵션...]
+# 사전공유키(PSK): 실행할 때마다 새로 만들고 출력하지 않는다. 양쪽에 같은 값을 준다.
+PSK="0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
 for ns in client gw; do
-  ip -n "$ns" xfrm state add src "$CLIENT_WAN" dst "$GW_WAN" proto esp spi 0x1001 reqid 1 replay-window 32 \
-    mode tunnel aead 'rfc4106(gcm(aes))' "$K_C2G" 128
-  ip -n "$ns" xfrm state add src "$GW_WAN" dst "$CLIENT_WAN" proto esp spi 0x1002 reqid 1 replay-window 32 \
-    mode tunnel aead 'rfc4106(gcm(aes))' "$K_G2C" 128
+  mkdir -p "$RUN/$ns" "/etc/netns/$ns/swanctl"
+  cat > "/etc/netns/$ns/strongswan.conf" <<'CONF'
+charon {
+  load = random nonce openssl kernel-netlink socket-default vici   # 필요한 플러그인만
+  install_routes = no            # 경로는 위에서 직접 넣었다
+  filelog { log { path = /run/charon.log
+                  flush_line = yes
+                  default = 1 } }
+}
+swanctl { load = random openssl }
+CONF
+  # 연결 설정(저장소의 파일) + 이번 실행의 PSK
+  { cat "$HERE/swanctl/$ns.conf"
+    printf 'secrets { ike-lab {\n id-1 = client\n id-2 = gw\n secret = %s\n} }\n' "$PSK"
+  } > "/etc/netns/$ns/swanctl/swanctl.conf"
+  chmod 600 "/etc/netns/$ns/swanctl/swanctl.conf"
+  ip netns exec "$ns" sh -c "mount --bind $RUN/$ns /run && exec /usr/lib/ipsec/charon" >/dev/null 2>&1 &
 done
-
-# IPsec SP(보안 정책): 어떤 패킷을 터널에 넣을지. 터널 안 주소 ↔ 보호 대역만 해당한다.
-C2G="tmpl src $CLIENT_WAN dst $GW_WAN proto esp reqid 1 mode tunnel"
-G2C="tmpl src $GW_WAN dst $CLIENT_WAN proto esp reqid 1 mode tunnel"
-ip -n client xfrm policy add src "$CLIENT_VIP/32" dst "$INSIDE" dir out $C2G
-ip -n client xfrm policy add src "$INSIDE" dst "$CLIENT_VIP/32" dir in  $G2C
-ip -n gw     xfrm policy add src "$CLIENT_VIP/32" dst "$INSIDE" dir fwd $C2G
-ip -n gw     xfrm policy add src "$INSIDE" dst "$CLIENT_VIP/32" dir out $G2C
+for ns in client gw; do
+  for _ in $(seq 50); do [ -S "$RUN/$ns/charon.vici" ] && break; sleep 0.1; done
+  sw "$ns" --load-all > "$RUN/$ns/swanctl.log" 2>&1 || { cat "$RUN/$ns/swanctl.log"; exit 1; }
+done
+# 첫 요청이 협상을 기다리지 않도록 터널을 미리 올린다: IKE SA(인증·키 교환) → CHILD SA(ESP 에 쓸 SA 한 쌍)
+sw client --initiate --child inside >> "$RUN/client/swanctl.log" 2>&1 || { cat "$RUN/client/swanctl.log"; exit 1; }
 
 # 게이트웨이 접근제어: 기본 거부 + 명시 허용
 ip netns exec gw nft -f "$(dirname "$0")/policy.nft"
