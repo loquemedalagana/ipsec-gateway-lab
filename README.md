@@ -345,13 +345,41 @@ ARP는 2계층 프로토콜이라 IPsec의 보호 대상이 아니고, 외부망
 
 외부망 브리지(`br0`)에 `attacker` 네임스페이스(`10.0.1.3`)를 세 번째 포트로 꽂았습니다. 브리지는 스위치라서, 학습이 끝나면 `client`와 `gw` 사이 유니캐스트를 두 포트로만 보냅니다. 그래서 그냥 꽂아 두는 것만으로는 공격자에게 터널 트래픽이 가지 않습니다. 공격자가 경로에 끼어들려면 거짓 ARP로 상대의 캐시를 자기 MAC으로 덮어야 합니다.
 
-```
-  client ─┐
-          ├─[ br0 ]─ gw
- attacker ─┘   (스위치: 평소엔 client↔gw 트래픽이 attacker 로 가지 않는다)
-```
-
 `run.sh`의 ARP 절은 공격자가 `client`와 `gw` 양쪽을 속여 경로에 끼어든 뒤, 공격자 자신의 인터페이스(`atk0`)에서 캡처해 결과를 봅니다. 위조는 2초 간격으로 나가므로, 캐시가 바뀔 때까지 기다렸다가 확인합니다.
+
+```mermaid
+sequenceDiagram
+  participant C as client
+  participant X as attacker
+  participant G as gw
+  rect rgba(21, 128, 61, 0.30)
+    Note over C,G: 기준: 속이기 전
+    C->>G: ESP (br0 가 두 포트로만 전달)
+    Note over X: 아무것도 보지 못함
+  end
+  rect rgba(185, 28, 28, 0.35)
+    Note over C,G: 경로 탈취: 양쪽 ARP 캐시가 공격자 MAC 으로 바뀜
+    X-->>C: 거짓 ARP (gw 라고 사칭)
+    X-->>G: 거짓 ARP (client 라고 사칭)
+    Note over C: 캐시 10.0.1.1 → 공격자 MAC
+  end
+  rect rgba(29, 78, 216, 0.30)
+    Note over C,G: 터널 요청: 공격자를 거쳐도 암호문만 보임
+    C->>X: ESP
+    X->>G: ESP (그대로 전달)
+    Note over X: ESP 26개, 터널 안 평문 0건
+  end
+  rect rgba(217, 119, 6, 0.40)
+    Note over C,G: 대조군: 터널 없는 요청
+    C->>X: 평문 TCP
+    Note over X: 목적지 주소·포트가 그대로 보임
+  end
+  rect rgba(109, 40, 217, 0.30)
+    Note over C,G: 대책: 정적 ARP (permanent)
+    X-->>C: 거짓 ARP
+    Note over C: 위조 응답을 무시, 캐시 유지
+  end
+```
 
 ### 결과
 
