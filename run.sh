@@ -119,7 +119,48 @@ RK_IKE=$(n_ike rekey); RK_LEAK=$(n_leak rekey)
 [ "$RK_IKE" -gt 0 ]                      || fail "외부망에 IKE 메시지가 보이지 않는다"
 [ "$RK_LEAK" -eq 0 ]                     || fail "키 교체 중 외부망에 평문이 보인다"
 
-# ── 5. 장애 실험: SA 가 사라지면 요청은 평문으로 새는가, 막히는가 ──
+# ── 5. ARP 스푸핑 관찰: 경로에 끼어든 공격자가 무엇을 보는가 ──
+# attacker 는 외부망 브리지(br0)에 함께 꽂혀 있다. 스위치라서 평소에는 client↔gw 유니캐스트가
+# attacker 에게 가지 않는다. 아래 arp_spoof_start 에 거짓 ARP 를 보내는 명령을 직접 채우면,
+# 상대의 ARP 캐시가 공격자의 MAC 으로 바뀌어 트래픽이 attacker 를 거친다.
+# 채우기 전에는(ARP_SPOOF_READY=0) 판정을 건너뛴다 — 비어 있어도 CI 가 깨지지 않도록.
+ARP_SPOOF_READY=0
+
+arp_spoof_start() {   # TODO(직접 작성): attacker 에서 거짓 ARP 를 보내 경로에 끼어든다.
+  :   # 예) gw(10.0.1.1) 를 사칭해 client 의 캐시를 attacker 의 MAC 으로 덮는다.
+      #     요청을 이어가려면(S1 이 ALLOW) client(10.0.1.2) 사칭도 필요하다.
+      #     attacker 에는 ip_forward=1 이 이미 켜져 있다(setup.sh).
+}
+arp_spoof_stop() {    # TODO(직접 작성): 거짓 ARP 전송을 멈추고 캐시를 되돌린다.
+  :
+}
+
+# attacker 쪽 캡처: 공격자가 자기 인터페이스에서 실제로 무엇을 보는지
+atk_cap_start() { ip netns exec attacker tcpdump -i atk0 -n -l > "$OUT/$1_atk.txt" 2>/dev/null & ATK_PID="$!"; sleep 1; }
+atk_cap_stop()  { sleep 1; kill $ATK_PID 2>/dev/null; sleep 0.5; }
+n_atk_esp()  { grep -c 'ESP(spi=' "$OUT/$1_atk.txt" || true; }                    # 공격자가 본 ESP
+n_atk_leak() { grep -c -e '10\.9\.0\.2' -e '\.8080' "$OUT/$1_atk.txt" || true; }  # 공격자가 본 터널 안 평문
+
+ARP_BEFORE=$(ip -n client neigh show 10.0.1.1 dev wan0 | awk '{print $5}')   # 공격 전 client 가 아는 gw 의 MAC
+arp_spoof_start
+sleep 1
+ARP_AFTER=$(ip -n client neigh show 10.0.1.1 dev wan0 | awk '{print $5}')    # 공격 후 바뀌었는지
+atk_cap_start arp
+ARP_S1=$(outcome 10.9.0.2 http://10.0.2.10:8080/)    # 터널 요청: 공격자를 거쳐도 암호문만 보여야 한다
+ARP_S2=$(outcome 10.0.1.2 http://10.0.2.10:8080/)    # 대조군: 터널 없는 요청은 공격자에게 평문으로 보인다
+atk_cap_stop
+arp_spoof_stop
+ARP_ESP=$(n_atk_esp arp); ARP_LEAK=$(n_atk_leak arp)
+if [ "$ARP_SPOOF_READY" -eq 1 ]; then
+  [ -n "$ARP_AFTER" ] && [ "$ARP_AFTER" != "$ARP_BEFORE" ] || fail "(ARP) client 의 캐시가 공격자 MAC 으로 바뀌지 않았다 ($ARP_BEFORE → $ARP_AFTER)"
+  [ "$ARP_ESP" -gt 0 ]  || fail "(ARP) 공격자가 경로에 있는데 ESP 가 보이지 않는다"
+  [ "$ARP_LEAK" -eq 0 ] || fail "(ARP) 공격자에게 터널 안 주소·포트가 평문으로 보인다 — 기밀성 깨짐"
+  ARP_NOTE="client 캐시 $ARP_BEFORE → $ARP_AFTER (공격자 MAC 으로 바뀜)"
+else
+  ARP_NOTE="미구현 — run.sh 의 arp_spoof_start/stop 을 채우고 ARP_SPOOF_READY=1 로 바꾸면 판정이 켜진다"
+fi
+
+# ── 6. 장애 실험: SA 가 사라지면 요청은 평문으로 새는가, 막히는가 ──
 # 커널의 SA 만 지운다(정책은 그대로). 기대: 요청은 실패하고, 평문은 어디에도 나가지 않는다.
 # IKE 데몬은 커널에서 SA 가 지워진 것을 모른다. 그래서 데몬이 있어도 저절로 복구되지 않는다.
 # (a) 게이트웨이의 SA 만 삭제 — 클라이언트는 계속 암호화해 보내지만 게이트웨이가 풀 수 없다
@@ -200,6 +241,13 @@ cp "$RUN/client/charon.log" "$OUT/ike_client.log"; cp "$RUN/gw/charon.log" "$OUT
   echo "| 교체 전 | \`${SPI_OLD% }\` |"; echo "| 새로 생긴 것 | \`${SPI_NEW% }\` |"; echo
   echo '외부망에서 본 IKE 메시지 (내용은 암호화되어 종류만 보인다)'
   echo '```'; grep 'isakmp' "$OUT/rekey_wan.txt" | head -4; echo '```'
+  echo '## ARP 스푸핑 관찰 (온패스 공격자)'
+  echo "| 항목 | 값 |"; echo '|---|---|'
+  echo "| 터널 요청(공격자 경유) | $ARP_S1 |"
+  echo "| 대조군: 터널 없는 요청 | $ARP_S2 |"
+  echo "| 공격자가 본 ESP | ${ARP_ESP}개 |"
+  echo "| 공격자가 본 터널 안 평문 | ${ARP_LEAK}개 |"
+  echo "| 상태 | $ARP_NOTE |"; echo
   echo '## 장애 실험: SA 삭제 → 복구 → 인증 실패'
   echo '| 상황 | 요청 결과 | 외부망 ESP | 외부망 평문 | app 도착 | 비고 |'
   echo '|---|---|---|---|---|---|'
